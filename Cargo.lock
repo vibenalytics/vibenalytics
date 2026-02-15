@@ -65,6 +65,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "claudnalytics"
+version = "2.0.0"
+dependencies = [
+ "chrono",
+ "gethostname",
+ "serde",
+ "serde_json",
+ "ureq",
+]
+
+[[package]]
 name = "core-foundation-sys"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -497,17 +508,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
-]
-
-[[package]]
-name = "sync-tool"
-version = "2.0.0"
-dependencies = [
- "chrono",
- "gethostname",
- "serde",
- "serde_json",
- "ureq",
 ]
 
 [[package]]

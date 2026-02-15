@@ -1,14 +1,14 @@
-/// sync-tool v2 — Claudnalytics metrics logger, aggregator and sync client
+/// claudnalytics v2 — Claudnalytics metrics logger, aggregator and sync client
 ///
 /// Single Rust binary. Zero runtime dependencies.
 ///
 /// Usage:
-///   sync-tool log                                  Read hook JSON from stdin, strip content, append to metrics.jsonl
-///   sync-tool sync                                 Aggregate + POST + flush
-///   sync-tool login <email> <password>             Login to get API key
-///   sync-tool login --api-key <key>                Set API key directly
-///   sync-tool status                               Show registration
-///   sync-tool aggregate <file>                     Dump aggregated JSON to stdout
+///   claudnalytics log                                  Read hook JSON from stdin, strip content, append to metrics.jsonl
+///   claudnalytics sync                                 Aggregate + POST + flush
+///   claudnalytics login <email> <password>             Login to get API key
+///   claudnalytics login --api-key <key>                Set API key directly
+///   claudnalytics status                               Show registration
+///   claudnalytics aggregate <file>                     Dump aggregated JSON to stdout
 use std::collections::HashMap;
 use std::env;
 use std::fs;
@@ -21,41 +21,29 @@ use serde_json::{json, Map, Value};
 
 // ---- Path helpers ----
 
-fn resolve_project_dir() -> PathBuf {
-    let exe = env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
-    let mut dir = exe.parent().unwrap_or(Path::new(".")).to_path_buf();
-    // If we're in target/release or target/debug, go up
-    if dir.ends_with("release") || dir.ends_with("debug") {
-        dir = dir.parent().unwrap().to_path_buf(); // target/
-        dir = dir.parent().unwrap().to_path_buf(); // native/
-    }
-    // dir = native/, go up to claudnalytics/, then to project root
-    let project = dir
-        .parent() // claudnalytics/
-        .and_then(|p| p.parent()) // project root
-        .unwrap_or(Path::new("."));
-    project.to_path_buf()
+/// Returns the directory containing the binary (resolving symlinks).
+fn data_dir() -> PathBuf {
+    let exe_raw = env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
+    let exe = fs::canonicalize(&exe_raw).unwrap_or(exe_raw);
+    exe.parent().unwrap_or(Path::new(".")).to_path_buf()
 }
 
-fn metrics_path(project_dir: &Path) -> PathBuf {
-    project_dir.join("metrics.jsonl")
+fn metrics_path(dir: &Path) -> PathBuf {
+    dir.join("metrics.jsonl")
 }
 
-fn config_path(project_dir: &Path) -> PathBuf {
-    project_dir
-        .join("claudnalytics")
-        .join("native")
-        .join(".sync-config.json")
+fn config_path(dir: &Path) -> PathBuf {
+    dir.join(".sync-config.json")
 }
 
-fn log_path(project_dir: &Path) -> PathBuf {
-    project_dir.join("claudnalytics").join("native").join("sync.log")
+fn log_path(dir: &Path) -> PathBuf {
+    dir.join("sync.log")
 }
 
 // ---- Logging ----
 
-fn sync_log(project_dir: &Path, msg: &str) {
-    let path = log_path(project_dir);
+fn sync_log(dir: &Path, msg: &str) {
+    let path = log_path(dir);
     let ts = Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
     if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) {
         let _ = writeln!(f, "[{ts}] {msg}");
@@ -64,13 +52,13 @@ fn sync_log(project_dir: &Path, msg: &str) {
 
 // ---- Config ----
 
-fn read_config(project_dir: &Path) -> Option<Value> {
-    let data = fs::read_to_string(config_path(project_dir)).ok()?;
+fn read_config(dir: &Path) -> Option<Value> {
+    let data = fs::read_to_string(config_path(dir)).ok()?;
     serde_json::from_str(&data).ok()
 }
 
-fn write_config(project_dir: &Path, cfg: &Value) -> io::Result<()> {
-    let path = config_path(project_dir);
+fn write_config(dir: &Path, cfg: &Value) -> io::Result<()> {
+    let path = config_path(dir);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -78,8 +66,8 @@ fn write_config(project_dir: &Path, cfg: &Value) -> io::Result<()> {
     fs::write(path, data)
 }
 
-fn config_get(project_dir: &Path, key: &str) -> Option<String> {
-    read_config(project_dir)?
+fn config_get(dir: &Path, key: &str) -> Option<String> {
+    read_config(dir)?
         .get(key)?
         .as_str()
         .map(|s| s.to_string())
@@ -149,7 +137,10 @@ fn strip_long_string(obj: &mut Map<String, Value>, key: &str, max_len: usize, pr
     }
 }
 
-fn cmd_log(project_dir: &Path) -> i32 {
+const SYNC_BUFFER_THRESHOLD: usize = 10;
+const SYNC_EVENTS: &[&str] = &["SessionStart", "SessionEnd", "Stop", "UserPromptSubmit"];
+
+fn cmd_log(dir: &Path) -> i32 {
     let mut input = String::new();
     if io::stdin().read_to_string(&mut input).is_err() || input.is_empty() {
         return 0;
@@ -160,7 +151,7 @@ fn cmd_log(project_dir: &Path) -> i32 {
         Err(_) => {
             let ts = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
             let line = json!({"logged_at": ts, "parse_error": true});
-            let path = metrics_path(project_dir);
+            let path = metrics_path(dir);
             if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) {
                 let _ = writeln!(f, "{}", line);
             }
@@ -172,6 +163,12 @@ fn cmd_log(project_dir: &Path) -> i32 {
         Some(o) => o,
         None => return 0,
     };
+
+    let event_name = obj
+        .get("hook_event_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
 
     obj.insert("_input_bytes".to_string(), json!(input.len()));
 
@@ -215,19 +212,25 @@ fn cmd_log(project_dir: &Path) -> i32 {
     }
 
     // Strip user prompt content
-    let is_prompt_submit = obj
-        .get("hook_event_name")
-        .and_then(|v| v.as_str())
-        .is_some_and(|s| s == "UserPromptSubmit");
-    if is_prompt_submit {
+    if event_name == "UserPromptSubmit" {
         if let Some(Value::String(prompt)) = obj.remove("prompt") {
             obj.insert("prompt_bytes".to_string(), json!(prompt.len()));
         }
     }
 
-    let path = metrics_path(project_dir);
+    let path = metrics_path(dir);
     if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) {
         let _ = writeln!(f, "{}", serde_json::to_string(&evt).unwrap_or_default());
+    }
+
+    // Auto-sync: flush on boundary events or when buffer threshold reached
+    let is_boundary = SYNC_EVENTS.contains(&event_name.as_str());
+    let line_count = fs::read_to_string(&path)
+        .map(|c| c.lines().filter(|l| !l.trim().is_empty()).count())
+        .unwrap_or(0);
+
+    if is_boundary || line_count >= SYNC_BUFFER_THRESHOLD {
+        cmd_sync(dir);
     }
 
     0
@@ -554,8 +557,8 @@ fn cmd_aggregate(filepath: &str) -> i32 {
     0
 }
 
-fn cmd_login_with_credentials(project_dir: &Path, email: &str, password: &str) -> i32 {
-    let api = config_get(project_dir, "apiBase")
+fn cmd_login_with_credentials(dir: &Path, email: &str, password: &str) -> i32 {
+    let api = config_get(dir, "apiBase")
         .unwrap_or_else(|| "http://localhost:3001/api".to_string());
 
     println!("Logging in as \"{email}\"...");
@@ -631,7 +634,7 @@ fn cmd_login_with_credentials(project_dir: &Path, email: &str, password: &str) -
         "displayName": user_name,
     });
 
-    if let Err(e) = write_config(project_dir, &cfg) {
+    if let Err(e) = write_config(dir, &cfg) {
         eprintln!("Failed to write config: {e}");
         return 1;
     }
@@ -641,12 +644,12 @@ fn cmd_login_with_credentials(project_dir: &Path, email: &str, password: &str) -
     println!("  API Key:  {}...{}", &api_key[..8], &api_key[api_key.len()-4..]);
     println!("\nSync will now use this identity automatically.");
 
-    sync_log(project_dir, &format!("Logged in: {user_name}"));
+    sync_log(dir, &format!("Logged in: {user_name}"));
     0
 }
 
-fn cmd_login_with_key(project_dir: &Path, api_key: &str) -> i32 {
-    let api = config_get(project_dir, "apiBase")
+fn cmd_login_with_key(dir: &Path, api_key: &str) -> i32 {
+    let api = config_get(dir, "apiBase")
         .unwrap_or_else(|| "http://localhost:3001/api".to_string());
 
     let cfg = json!({
@@ -655,7 +658,7 @@ fn cmd_login_with_key(project_dir: &Path, api_key: &str) -> i32 {
         "displayName": "user",
     });
 
-    if let Err(e) = write_config(project_dir, &cfg) {
+    if let Err(e) = write_config(dir, &cfg) {
         eprintln!("Failed to write config: {e}");
         return 1;
     }
@@ -664,15 +667,15 @@ fn cmd_login_with_key(project_dir: &Path, api_key: &str) -> i32 {
     println!("  API Key:  {}...{}", &api_key[..8.min(api_key.len())], &api_key[api_key.len().saturating_sub(4)..]);
     println!("\nSync will now use this key automatically.");
 
-    sync_log(project_dir, "API key configured directly");
+    sync_log(dir, "API key configured directly");
     0
 }
 
-fn cmd_status(project_dir: &Path) -> i32 {
-    let cfg = match read_config(project_dir) {
+fn cmd_status(dir: &Path) -> i32 {
+    let cfg = match read_config(dir) {
         Some(c) => c,
         None => {
-            println!("Not configured. Run: sync-tool login <email> <password>");
+            println!("Not configured. Run: claudnalytics login <email> <password>");
             return 1;
         }
     };
@@ -698,23 +701,23 @@ fn cmd_status(project_dir: &Path) -> i32 {
     0
 }
 
-fn cmd_sync(project_dir: &Path) -> i32 {
-    let api_key = match config_get(project_dir, "apiKey") {
+fn cmd_sync(dir: &Path) -> i32 {
+    let api_key = match config_get(dir, "apiKey") {
         Some(key) => key,
         None => {
-            sync_log(project_dir, "No API key configured — skipping sync");
+            sync_log(dir, "No API key configured — skipping sync");
             return 0;
         }
     };
 
-    let api_base = config_get(project_dir, "apiBase")
+    let api_base = config_get(dir, "apiBase")
         .unwrap_or_else(|| "http://localhost:3001/api".to_string());
 
-    let mp = metrics_path(project_dir);
+    let mp = metrics_path(dir);
     match fs::metadata(&mp) {
         Ok(m) if m.len() > 0 => {}
         _ => {
-            sync_log(project_dir, "No metrics to sync");
+            sync_log(dir, "No metrics to sync");
             return 0;
         }
     };
@@ -729,20 +732,20 @@ fn cmd_sync(project_dir: &Path) -> i32 {
                 .elapsed()
             {
                 if age.as_secs() < 60 {
-                    sync_log(project_dir, "Lock file exists, skipping sync");
+                    sync_log(dir, "Lock file exists, skipping sync");
                     return 0;
                 }
             }
         }
         let _ = fs::remove_file(&lock);
-        sync_log(project_dir, "Removed stale lock");
+        sync_log(dir, "Removed stale lock");
     }
 
     let _ = fs::write(&lock, format!("{}", std::process::id()));
 
     let sessions = aggregate_file(&mp);
     if sessions.is_empty() {
-        sync_log(project_dir, "No sessions to sync");
+        sync_log(dir, "No sessions to sync");
         let _ = fs::remove_file(&lock);
         return 0;
     }
@@ -751,7 +754,7 @@ fn cmd_sync(project_dir: &Path) -> i32 {
     let payload_str = serde_json::to_string(&payload).unwrap_or_default();
     let n = sessions.len();
 
-    sync_log(project_dir, &format!("Syncing {n} sessions to {api_base}/sync"));
+    sync_log(dir, &format!("Syncing {n} sessions to {api_base}/sync"));
 
     // POST to /api/sync with API key header
     let url = format!("{api_base}/sync");
@@ -759,15 +762,15 @@ fn cmd_sync(project_dir: &Path) -> i32 {
 
     let rc = match result {
         Ok((200, resp)) => {
-            sync_log(project_dir, &format!("Sync OK: {resp}"));
+            sync_log(dir, &format!("Sync OK: {resp}"));
 
             let ts = Utc::now().format("%Y%m%d_%H%M%S");
-            let archive = project_dir.join(format!("metrics.synced.{ts}.jsonl"));
+            let archive = dir.join(format!("metrics.synced.{ts}.jsonl"));
             let _ = fs::rename(&mp, &archive);
             let _ = fs::write(&mp, "");
 
             sync_log(
-                project_dir,
+                dir,
                 &format!(
                     "Flushed metrics.jsonl, archived to {}",
                     archive.file_name().unwrap_or_default().to_string_lossy()
@@ -776,11 +779,11 @@ fn cmd_sync(project_dir: &Path) -> i32 {
             0
         }
         Ok((code, resp)) => {
-            sync_log(project_dir, &format!("Sync FAILED (HTTP {code}): {resp}"));
+            sync_log(dir, &format!("Sync FAILED (HTTP {code}): {resp}"));
             1
         }
         Err(e) => {
-            sync_log(project_dir, &format!("Sync FAILED: {e}"));
+            sync_log(dir, &format!("Sync FAILED: {e}"));
             1
         }
     };
@@ -793,38 +796,38 @@ fn cmd_sync(project_dir: &Path) -> i32 {
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    let project_dir = resolve_project_dir();
+    let dir = data_dir();
 
     if args.len() < 2 {
         eprintln!("Usage:");
-        eprintln!("  sync-tool log                            Log hook event from stdin");
-        eprintln!("  sync-tool sync                           Sync metrics to backend");
-        eprintln!("  sync-tool login <email> <password>       Login to get API key");
-        eprintln!("  sync-tool login --api-key <key>          Set API key directly");
-        eprintln!("  sync-tool status                         Show configuration");
-        eprintln!("  sync-tool aggregate <file>               Output aggregated JSON");
+        eprintln!("  claudnalytics log                            Log hook event from stdin");
+        eprintln!("  claudnalytics sync                           Sync metrics to backend");
+        eprintln!("  claudnalytics login <email> <password>       Login to get API key");
+        eprintln!("  claudnalytics login --api-key <key>          Set API key directly");
+        eprintln!("  claudnalytics status                         Show configuration");
+        eprintln!("  claudnalytics aggregate <file>               Output aggregated JSON");
         std::process::exit(1);
     }
 
     let rc = match args[1].as_str() {
-        "log" => cmd_log(&project_dir),
-        "sync" => cmd_sync(&project_dir),
+        "log" => cmd_log(&dir),
+        "sync" => cmd_sync(&dir),
         "login" => {
             if args.len() >= 4 && args[2] == "--api-key" {
-                cmd_login_with_key(&project_dir, &args[3])
+                cmd_login_with_key(&dir, &args[3])
             } else if args.len() >= 4 {
-                cmd_login_with_credentials(&project_dir, &args[2], &args[3])
+                cmd_login_with_credentials(&dir, &args[2], &args[3])
             } else {
                 eprintln!("Usage:");
-                eprintln!("  sync-tool login <email> <password>");
-                eprintln!("  sync-tool login --api-key <key>");
+                eprintln!("  claudnalytics login <email> <password>");
+                eprintln!("  claudnalytics login --api-key <key>");
                 1
             }
         }
-        "status" => cmd_status(&project_dir),
+        "status" => cmd_status(&dir),
         "aggregate" => {
             if args.len() < 3 {
-                eprintln!("Usage: sync-tool aggregate <file>");
+                eprintln!("Usage: claudnalytics aggregate <file>");
                 std::process::exit(1);
             }
             cmd_aggregate(&args[2])
