@@ -9,10 +9,14 @@
 ///   claudnalytics login --api-key <key>                Set API key directly
 ///   claudnalytics status                               Show registration
 ///   claudnalytics aggregate <file>                     Dump aggregated JSON to stdout
-use std::collections::HashMap;
+///   claudnalytics tui                                  Launch interactive TUI dashboard
+///   claudnalytics import-from-history                  Parse ~/.claude/ session transcripts → dry-run JSONL
+
+mod tui;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -252,6 +256,15 @@ struct PermissionStat {
     count: u32,
 }
 
+struct ModelTokens {
+    model: String,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+    request_count: u32,
+}
+
 struct Session {
     session_id: String,
     project: String,
@@ -261,12 +274,15 @@ struct Session {
     events: HashMap<String, u32>,
     tools: HashMap<String, u32>,
     prompt_count: u32,
+    message_count: u32,
     total_input_bytes: u64,
     total_response_bytes: u64,
     tool_latencies: Vec<ToolLatency>,
     permission_requests: Vec<PermissionStat>,
     tool_response_sizes: HashMap<String, (u64, u32)>,
     parallel_tool_batches: u32,
+    model_tokens: Vec<ModelTokens>,
+    hostname: String,
 }
 
 impl Session {
@@ -280,12 +296,15 @@ impl Session {
             events: HashMap::new(),
             tools: HashMap::new(),
             prompt_count: 0,
+            message_count: 0,
             total_input_bytes: 0,
             total_response_bytes: 0,
             tool_latencies: Vec::new(),
             permission_requests: Vec::new(),
             tool_response_sizes: HashMap::new(),
             parallel_tool_batches: 0,
+            model_tokens: Vec::new(),
+            hostname: String::new(),
         }
     }
 }
@@ -792,6 +811,346 @@ fn cmd_sync(dir: &Path) -> i32 {
     rc
 }
 
+// ---- Import from history ----
+
+fn claude_dir() -> PathBuf {
+    if let Ok(home) = env::var("HOME") {
+        PathBuf::from(home).join(".claude")
+    } else {
+        PathBuf::from(".claude")
+    }
+}
+
+/// Parse ISO 8601 timestamp with optional milliseconds: "2026-01-31T18:15:00.104Z" or "2026-01-31T18:15:00Z"
+fn parse_iso_flex(ts: &str) -> Option<i64> {
+    // Try with milliseconds first
+    chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%S%.fZ")
+        .or_else(|_| chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%SZ"))
+        .ok()
+        .map(|dt| dt.and_utc().timestamp())
+}
+
+/// Discover all top-level session JSONL files in ~/.claude/projects/
+fn discover_sessions(claude: &Path) -> Vec<(String, PathBuf)> {
+    let projects_dir = claude.join("projects");
+    let mut results: Vec<(String, PathBuf)> = Vec::new();
+
+    let entries = match fs::read_dir(&projects_dir) {
+        Ok(e) => e,
+        Err(_) => return results,
+    };
+
+    for entry in entries.flatten() {
+        let project_dir = entry.path();
+        if !project_dir.is_dir() {
+            continue;
+        }
+
+        // Decode project name from dir name: "-Users-foo-Documents-myproject" → "myproject"
+        let dir_name = project_dir
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let project_name = dir_name.rsplit('-').next().unwrap_or("unknown").to_string();
+
+        // Find *.jsonl files directly in project dir (not in subdirectories)
+        if let Ok(files) = fs::read_dir(&project_dir) {
+            for file in files.flatten() {
+                let path = file.path();
+                if path.is_file()
+                    && path.extension().map(|e| e == "jsonl").unwrap_or(false)
+                {
+                    results.push((project_name.clone(), path));
+                }
+            }
+        }
+    }
+
+    results
+}
+
+/// Parse a single session transcript JSONL file into a Session.
+fn parse_session_transcript(filepath: &Path, fallback_project: &str) -> Option<Session> {
+    let file = fs::File::open(filepath).ok()?;
+    let reader = io::BufReader::new(file);
+
+    let mut session = Session::new("unknown");
+    session.project = fallback_project.to_string();
+
+    let mut seen_requests: HashSet<String> = HashSet::new();
+    let mut model_map: HashMap<String, (u64, u64, u64, u64, u32)> = HashMap::new(); // model → (in, out, cache_r, cache_w, count)
+
+    for line_result in reader.lines() {
+        let line = match line_result {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        let line = line.trim().to_string();
+        if line.is_empty() {
+            continue;
+        }
+
+        let evt: Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        // Track session ID
+        if session.session_id == "unknown" {
+            if let Some(sid) = evt.get("sessionId").and_then(|v| v.as_str()) {
+                session.session_id = sid.to_string();
+            }
+        }
+
+        // Track timestamps
+        if let Some(ts) = evt.get("timestamp").and_then(|v| v.as_str()) {
+            if session.started_at.is_empty() || ts < session.started_at.as_str() {
+                session.started_at = ts.to_string();
+            }
+            if session.ended_at.is_empty() || ts > session.ended_at.as_str() {
+                session.ended_at = ts.to_string();
+            }
+        }
+
+        let msg_type = evt.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+        match msg_type {
+            "assistant" => {
+                session.message_count += 1;
+
+                let request_id = evt.get("requestId").and_then(|v| v.as_str()).unwrap_or("");
+                let model = evt.pointer("/message/model").and_then(|v| v.as_str()).unwrap_or("");
+
+                // Token counting: deduplicate by requestId, skip synthetic
+                if !request_id.is_empty()
+                    && model != "<synthetic>"
+                    && !model.is_empty()
+                    && seen_requests.insert(request_id.to_string())
+                {
+                    let usage = evt.pointer("/message/usage");
+                    if let Some(u) = usage {
+                        let entry = model_map.entry(model.to_string()).or_insert((0, 0, 0, 0, 0));
+                        entry.0 += u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                        entry.1 += u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                        entry.2 += u.get("cache_read_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                        entry.3 += u.get("cache_creation_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                        entry.4 += 1;
+                    }
+                }
+
+                // Tool counting from content blocks
+                if let Some(content) = evt.pointer("/message/content").and_then(|v| v.as_array()) {
+                    for block in content {
+                        if block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
+                            let tool = block.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
+                            *session.tools.entry(tool.to_string()).or_insert(0) += 1;
+                        }
+                    }
+                }
+            }
+
+            "user" => {
+                session.message_count += 1;
+
+                // Real prompt = content is string; tool result = content is array
+                let is_prompt = evt
+                    .pointer("/message/content")
+                    .map(|v| v.is_string())
+                    .unwrap_or(false);
+                if is_prompt {
+                    session.prompt_count += 1;
+                }
+
+                // Extract metadata
+                if let Some(pm) = evt.get("permissionMode").and_then(|v| v.as_str()) {
+                    session.permission_mode = pm.to_string();
+                }
+                if session.project == fallback_project || session.project == "unknown" {
+                    if let Some(cwd) = evt.get("cwd").and_then(|v| v.as_str()) {
+                        if let Some(last) = cwd.rsplit('/').next() {
+                            if !last.is_empty() {
+                                session.project = last.to_string();
+                            }
+                        }
+                    }
+                }
+            }
+
+            _ => {} // progress, system, file-history-snapshot, summary — skip
+        }
+    }
+
+    // Skip empty/broken sessions
+    if session.session_id == "unknown" && session.message_count == 0 {
+        return None;
+    }
+
+    // Convert model_map → model_tokens
+    session.model_tokens = model_map
+        .into_iter()
+        .map(|(model, (inp, out, cr, cw, cnt))| ModelTokens {
+            model,
+            input_tokens: inp,
+            output_tokens: out,
+            cache_read_tokens: cr,
+            cache_write_tokens: cw,
+            request_count: cnt,
+        })
+        .collect();
+
+    // Set hostname
+    session.hostname = gethostname::gethostname()
+        .to_string_lossy()
+        .split('.')
+        .next()
+        .unwrap_or("unknown")
+        .to_string();
+
+    Some(session)
+}
+
+fn cmd_import_from_history(dir: &Path, project_filter: Option<&str>) -> i32 {
+    let claude = claude_dir();
+    if !claude.exists() {
+        eprintln!("Claude data directory not found: {}", claude.display());
+        return 1;
+    }
+
+    eprintln!("Scanning {}...", claude.join("projects").display());
+    let mut discovered = discover_sessions(&claude);
+
+    // Filter by project name (case-insensitive substring match)
+    if let Some(filter) = project_filter {
+        let filter_lower = filter.to_lowercase();
+        let before = discovered.len();
+        discovered.retain(|(name, _)| name.to_lowercase().contains(&filter_lower));
+        eprintln!("Filter '{}': {} of {} session files match", filter, discovered.len(), before);
+    }
+
+    if discovered.is_empty() {
+        eprintln!("No session files found.");
+        return 1;
+    }
+
+    eprintln!("Found {} session files. Parsing...", discovered.len());
+
+    let output_path = dir.join("history-import.jsonl");
+    let mut out_file = match fs::File::create(&output_path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("Cannot create output file: {e}");
+            return 1;
+        }
+    };
+
+    let mut total_sessions = 0u32;
+    let mut total_prompts = 0u32;
+    let mut total_tools = 0u32;
+    let mut total_tokens = 0u64;
+    let mut projects: HashSet<String> = HashSet::new();
+    let mut earliest = String::new();
+    let mut latest = String::new();
+
+    for (i, (project_name, path)) in discovered.iter().enumerate() {
+        let file_name = path.file_name().unwrap_or_default().to_string_lossy();
+        eprint!("\r  [{}/{}] Parsing {}...", i + 1, discovered.len(), file_name);
+
+        let session = match parse_session_transcript(path, project_name) {
+            Some(s) => s,
+            None => continue,
+        };
+
+        // Track stats
+        total_sessions += 1;
+        total_prompts += session.prompt_count;
+        total_tools += session.tools.values().sum::<u32>();
+        projects.insert(session.project.clone());
+
+        for mt in &session.model_tokens {
+            total_tokens += mt.input_tokens + mt.output_tokens + mt.cache_read_tokens + mt.cache_write_tokens;
+        }
+
+        if !session.started_at.is_empty() {
+            if earliest.is_empty() || session.started_at < earliest {
+                earliest = session.started_at.clone();
+            }
+            if latest.is_empty() || session.ended_at > latest {
+                latest = session.ended_at.clone();
+            }
+        }
+
+        // Build output JSON
+        let mut obj = json!({
+            "session_id": session.session_id,
+            "project": session.project,
+            "started_at": session.started_at,
+            "ended_at": session.ended_at,
+            "prompt_count": session.prompt_count,
+            "message_count": session.message_count,
+            "tools": session.tools,
+            "hostname": session.hostname,
+        });
+
+        if !session.permission_mode.is_empty() {
+            obj["permission_mode"] = json!(session.permission_mode);
+        }
+
+        if let (Some(start), Some(end)) = (
+            parse_iso_flex(&session.started_at),
+            parse_iso_flex(&session.ended_at),
+        ) {
+            obj["duration_seconds"] = json!(end - start);
+        }
+
+        if !session.model_tokens.is_empty() {
+            let tokens: Vec<Value> = session
+                .model_tokens
+                .iter()
+                .map(|mt| {
+                    json!({
+                        "model": mt.model,
+                        "input_tokens": mt.input_tokens,
+                        "output_tokens": mt.output_tokens,
+                        "cache_read_tokens": mt.cache_read_tokens,
+                        "cache_write_tokens": mt.cache_write_tokens,
+                        "request_count": mt.request_count,
+                    })
+                })
+                .collect();
+            obj["model_tokens"] = json!(tokens);
+        }
+
+        let line = serde_json::to_string(&obj).unwrap_or_default();
+        let _ = writeln!(out_file, "{}", line);
+    }
+
+    eprintln!("\r                                                              ");
+
+    // Format token count
+    let tok_display = if total_tokens >= 1_000_000_000 {
+        format!("{:.1}B", total_tokens as f64 / 1e9)
+    } else if total_tokens >= 1_000_000 {
+        format!("{:.1}M", total_tokens as f64 / 1e6)
+    } else if total_tokens >= 1_000 {
+        format!("{:.1}K", total_tokens as f64 / 1e3)
+    } else {
+        format!("{total_tokens}")
+    };
+
+    eprintln!("Done!");
+    eprintln!("  Sessions:  {total_sessions}");
+    eprintln!("  Projects:  {}", projects.len());
+    eprintln!("  Prompts:   {total_prompts}");
+    eprintln!("  Tool calls:{total_tools}");
+    eprintln!("  Tokens:    {tok_display}");
+    if !earliest.is_empty() {
+        eprintln!("  Range:     {} .. {}", &earliest[..10.min(earliest.len())], &latest[..10.min(latest.len())]);
+    }
+    eprintln!("  Output:    {}", output_path.display());
+    0
+}
+
 // ---- Main ----
 
 fn main() {
@@ -806,6 +1165,8 @@ fn main() {
         eprintln!("  claudnalytics login --api-key <key>          Set API key directly");
         eprintln!("  claudnalytics status                         Show configuration");
         eprintln!("  claudnalytics aggregate <file>               Output aggregated JSON");
+        eprintln!("  claudnalytics tui                            Interactive TUI dashboard");
+        eprintln!("  claudnalytics import-from-history [project]   Parse ~/.claude/ transcripts to JSONL");
         std::process::exit(1);
     }
 
@@ -831,6 +1192,11 @@ fn main() {
                 std::process::exit(1);
             }
             cmd_aggregate(&args[2])
+        }
+        "tui" => tui::run(&dir),
+        "import-from-history" => {
+            let filter = args.get(2).map(|s| s.as_str());
+            cmd_import_from_history(&dir, filter)
         }
         other => {
             eprintln!("Unknown command: {other}");
