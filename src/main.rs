@@ -213,24 +213,14 @@ fn cmd_log(dir: &Path) -> i32 {
         obj.insert("tool_response_bytes".to_string(), json!(bytes));
     }
 
-    // Strip transcript_path → project name + path hash
-    if let Some(Value::String(tp)) = obj.remove("transcript_path") {
-        // Extract project path from transcript_path (parent of .claude session dir)
-        let parts: Vec<&str> = tp.split('/').filter(|s| !s.is_empty()).collect();
-        let project = if parts.len() >= 2 {
-            parts[parts.len() - 2]
-        } else {
-            "unknown"
-        };
-        obj.insert("project".to_string(), json!(project));
-        obj.insert("path_hash".to_string(), json!(hash_path(&tp)));
-    }
+    // Strip transcript_path (not needed, avoid storing paths)
+    obj.remove("transcript_path");
 
-    // Hash cwd if present (used as fallback for path_hash)
-    if let Some(cwd) = obj.get("cwd").and_then(|v| v.as_str()).map(|s| s.to_string()) {
-        if !obj.contains_key("path_hash") {
-            obj.insert("path_hash".to_string(), json!(hash_path(&cwd)));
-        }
+    // Use cwd as project identity: hash for stable ID, last dir name for display
+    if let Some(Value::String(cwd)) = obj.remove("cwd") {
+        obj.insert("path_hash".to_string(), json!(hash_path(&cwd)));
+        let project_name = cwd.rsplit('/').find(|s| !s.is_empty()).unwrap_or("unknown");
+        obj.insert("project".to_string(), json!(project_name));
     }
 
     // Strip user prompt content
@@ -375,18 +365,6 @@ fn aggregate_file(filepath: &Path) -> Vec<Session> {
         if let Some(proj) = evt.get("project").and_then(|v| v.as_str()) {
             if proj != "unknown" {
                 s.project = proj.to_string();
-            }
-        } else if s.project == "unknown" {
-            if let Some(cwd) = evt.get("cwd").and_then(|v| v.as_str()) {
-                if let Some(last) = cwd.rsplit('/').next() {
-                    if !last.is_empty() {
-                        s.project = last.to_string();
-                    }
-                }
-                // Generate path_hash from cwd if not already set
-                if s.path_hash.is_empty() {
-                    s.path_hash = hash_path(cwd);
-                }
             }
         }
 
