@@ -10,7 +10,7 @@
 ///   claudnalytics status                               Show registration
 ///   claudnalytics aggregate <file>                     Dump aggregated JSON to stdout
 ///   claudnalytics tui                                  Launch interactive TUI dashboard
-///   claudnalytics import-from-history                  Parse ~/.claude/ session transcripts → dry-run JSONL
+///   claudnalytics import-from-history [project] [--sync]  Parse ~/.claude/ transcripts → JSONL (+ sync)
 
 mod tui;
 use std::collections::{HashMap, HashSet};
@@ -981,7 +981,21 @@ fn parse_session_transcript(filepath: &Path, fallback_project: &str, fallback_pa
     Some(session)
 }
 
-fn cmd_import_from_history(dir: &Path, project_filter: Option<&str>) -> i32 {
+fn post_import_batch(api_base: &str, api_key: &str, sessions: &[Value]) -> Result<(u32, u32), String> {
+    let payload = json!({ "sessions": sessions });
+    let payload_str = serde_json::to_string(&payload).map_err(|e| format!("{e}"))?;
+    let url = format!("{api_base}/sync/import");
+    let (status, body) = http_post(&url, &payload_str, Some(api_key))?;
+    if status != 200 {
+        return Err(format!("HTTP {status}: {body}"));
+    }
+    let resp: Value = serde_json::from_str(&body).map_err(|e| format!("Parse error: {e}"))?;
+    let added = resp.pointer("/data/added").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    let skipped = resp.pointer("/data/skipped").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    Ok((added, skipped))
+}
+
+fn cmd_import_from_history(dir: &Path, project_filter: Option<&str>, do_sync: bool) -> i32 {
     let claude = claude_dir();
     if !claude.exists() {
         eprintln!("Claude data directory not found: {}", claude.display());
@@ -1021,6 +1035,7 @@ fn cmd_import_from_history(dir: &Path, project_filter: Option<&str>) -> i32 {
     let mut projects: HashSet<String> = HashSet::new();
     let mut earliest = String::new();
     let mut latest = String::new();
+    let mut all_session_json: Vec<Value> = Vec::new();
 
     for (i, (project_name, ph, path)) in discovered.iter().enumerate() {
         let file_name = path.file_name().unwrap_or_default().to_string_lossy();
@@ -1054,7 +1069,6 @@ fn cmd_import_from_history(dir: &Path, project_filter: Option<&str>) -> i32 {
             "started_at": session.started_at,
             "ended_at": session.ended_at,
             "prompt_count": session.prompt_count,
-            "message_count": session.message_count,
             "tools": session.tools,
             "hostname": session.hostname,
         });
@@ -1072,6 +1086,7 @@ fn cmd_import_from_history(dir: &Path, project_filter: Option<&str>) -> i32 {
 
         let line = serde_json::to_string(&obj).unwrap_or_default();
         let _ = writeln!(out_file, "{}", line);
+        all_session_json.push(obj);
     }
 
     eprintln!("\r                                                              ");
@@ -1085,6 +1100,48 @@ fn cmd_import_from_history(dir: &Path, project_filter: Option<&str>) -> i32 {
         eprintln!("  Range:     {} .. {}", &earliest[..10.min(earliest.len())], &latest[..10.min(latest.len())]);
     }
     eprintln!("  Output:    {}", output_path.display());
+
+    // Sync to backend if --sync flag is set
+    if do_sync {
+        let api_key = match config_get(dir, "apiKey") {
+            Some(key) => key,
+            None => {
+                eprintln!("\nNo API key configured. Run: claudnalytics login <email> <password>");
+                return 1;
+            }
+        };
+        let api_base = config_get(dir, "apiBase")
+            .unwrap_or_else(|| "http://localhost:3001/api".to_string());
+
+        eprintln!("\nSyncing to {}...", api_base);
+
+        let batch_size = 50;
+        let mut total_added = 0u32;
+        let mut total_skipped = 0u32;
+        let chunks: Vec<&[Value]> = all_session_json.chunks(batch_size).collect();
+        let num_batches = chunks.len();
+
+        for (batch_idx, chunk) in chunks.iter().enumerate() {
+            eprint!("\r  Batch {}/{} ({} sessions)...", batch_idx + 1, num_batches, chunk.len());
+            match post_import_batch(&api_base, &api_key, chunk) {
+                Ok((added, skipped)) => {
+                    total_added += added;
+                    total_skipped += skipped;
+                }
+                Err(e) => {
+                    eprintln!("\n  Batch {} failed: {}", batch_idx + 1, e);
+                    eprintln!("  {} sessions synced before failure.", total_added);
+                    return 1;
+                }
+            }
+        }
+
+        eprintln!("\r                                                  ");
+        eprintln!("Sync complete!");
+        eprintln!("  Added:   {total_added}");
+        eprintln!("  Skipped: {total_skipped} (already existed)");
+    }
+
     0
 }
 
@@ -1103,7 +1160,7 @@ fn main() {
         eprintln!("  claudnalytics status                         Show configuration");
         eprintln!("  claudnalytics aggregate <file>               Output aggregated JSON");
         eprintln!("  claudnalytics tui                            Interactive TUI dashboard");
-        eprintln!("  claudnalytics import-from-history [project]   Parse ~/.claude/ transcripts to JSONL");
+        eprintln!("  claudnalytics import-from-history [project] [--sync]  Parse transcripts + sync to backend");
         std::process::exit(1);
     }
 
@@ -1132,8 +1189,16 @@ fn main() {
         }
         "tui" => tui::run(&dir),
         "import-from-history" => {
-            let filter = args.get(2).map(|s| s.as_str());
-            cmd_import_from_history(&dir, filter)
+            let mut filter: Option<&str> = None;
+            let mut do_sync = false;
+            for arg in &args[2..] {
+                match arg.as_str() {
+                    "--sync" => do_sync = true,
+                    other if filter.is_none() => filter = Some(other),
+                    _ => {}
+                }
+            }
+            cmd_import_from_history(&dir, filter, do_sync)
         }
         other => {
             eprintln!("Unknown command: {other}");
