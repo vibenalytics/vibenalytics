@@ -20,8 +20,17 @@ use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use std::hash::{Hash, Hasher};
+use std::collections::hash_map::DefaultHasher;
+
 use chrono::Utc;
 use serde_json::{json, Map, Value};
+
+fn hash_path(path: &str) -> String {
+    let mut h = DefaultHasher::new();
+    path.hash(&mut h);
+    format!("{:016x}", h.finish())
+}
 
 // ---- Path helpers ----
 
@@ -204,8 +213,9 @@ fn cmd_log(dir: &Path) -> i32 {
         obj.insert("tool_response_bytes".to_string(), json!(bytes));
     }
 
-    // Strip transcript_path → project name
+    // Strip transcript_path → project name + path hash
     if let Some(Value::String(tp)) = obj.remove("transcript_path") {
+        // Extract project path from transcript_path (parent of .claude session dir)
         let parts: Vec<&str> = tp.split('/').filter(|s| !s.is_empty()).collect();
         let project = if parts.len() >= 2 {
             parts[parts.len() - 2]
@@ -213,6 +223,14 @@ fn cmd_log(dir: &Path) -> i32 {
             "unknown"
         };
         obj.insert("project".to_string(), json!(project));
+        obj.insert("path_hash".to_string(), json!(hash_path(&tp)));
+    }
+
+    // Hash cwd if present (used as fallback for path_hash)
+    if let Some(cwd) = obj.get("cwd").and_then(|v| v.as_str()).map(|s| s.to_string()) {
+        if !obj.contains_key("path_hash") {
+            obj.insert("path_hash".to_string(), json!(hash_path(&cwd)));
+        }
     }
 
     // Strip user prompt content
@@ -256,18 +274,10 @@ struct PermissionStat {
     count: u32,
 }
 
-struct ModelTokens {
-    model: String,
-    input_tokens: u64,
-    output_tokens: u64,
-    cache_read_tokens: u64,
-    cache_write_tokens: u64,
-    request_count: u32,
-}
-
 struct Session {
     session_id: String,
     project: String,
+    path_hash: String,
     started_at: String,
     ended_at: String,
     permission_mode: String,
@@ -281,7 +291,6 @@ struct Session {
     permission_requests: Vec<PermissionStat>,
     tool_response_sizes: HashMap<String, (u64, u32)>,
     parallel_tool_batches: u32,
-    model_tokens: Vec<ModelTokens>,
     hostname: String,
 }
 
@@ -290,6 +299,7 @@ impl Session {
         Session {
             session_id: id.to_string(),
             project: "unknown".to_string(),
+            path_hash: String::new(),
             started_at: String::new(),
             ended_at: String::new(),
             permission_mode: String::new(),
@@ -303,7 +313,6 @@ impl Session {
             permission_requests: Vec::new(),
             tool_response_sizes: HashMap::new(),
             parallel_tool_batches: 0,
-            model_tokens: Vec::new(),
             hostname: String::new(),
         }
     }
@@ -356,6 +365,13 @@ fn aggregate_file(filepath: &Path) -> Vec<Session> {
             }
         }
 
+        // Collect path_hash from event (set by cmd_log)
+        if let Some(ph) = evt.get("path_hash").and_then(|v| v.as_str()) {
+            if s.path_hash.is_empty() {
+                s.path_hash = ph.to_string();
+            }
+        }
+
         if let Some(proj) = evt.get("project").and_then(|v| v.as_str()) {
             if proj != "unknown" {
                 s.project = proj.to_string();
@@ -366,6 +382,10 @@ fn aggregate_file(filepath: &Path) -> Vec<Session> {
                     if !last.is_empty() {
                         s.project = last.to_string();
                     }
+                }
+                // Generate path_hash from cwd if not already set
+                if s.path_hash.is_empty() {
+                    s.path_hash = hash_path(cwd);
                 }
             }
         }
@@ -507,7 +527,8 @@ fn build_payload(sessions: &[Session]) -> Value {
         .map(|s| {
             let mut obj = json!({
                 "session_id": s.session_id,
-                "project": s.project,
+                "project_hash": s.path_hash,
+                "project_name": s.project,
                 "started_at": s.started_at,
                 "ended_at": s.ended_at,
                 "events": s.events,
@@ -831,9 +852,10 @@ fn parse_iso_flex(ts: &str) -> Option<i64> {
 }
 
 /// Discover all top-level session JSONL files in ~/.claude/projects/
-fn discover_sessions(claude: &Path) -> Vec<(String, PathBuf)> {
+/// Returns (project_name, path_hash, jsonl_path) tuples
+fn discover_sessions(claude: &Path) -> Vec<(String, String, PathBuf)> {
     let projects_dir = claude.join("projects");
-    let mut results: Vec<(String, PathBuf)> = Vec::new();
+    let mut results: Vec<(String, String, PathBuf)> = Vec::new();
 
     let entries = match fs::read_dir(&projects_dir) {
         Ok(e) => e,
@@ -853,6 +875,9 @@ fn discover_sessions(claude: &Path) -> Vec<(String, PathBuf)> {
             .to_string_lossy()
             .to_string();
         let project_name = dir_name.rsplit('-').next().unwrap_or("unknown").to_string();
+        // Reconstruct original path from dir name for hashing: "-Users-foo-bar" → "/Users/foo/bar"
+        let original_path = dir_name.replacen('-', "/", 1).replace('-', "/");
+        let path_hash_val = hash_path(&original_path);
 
         // Find *.jsonl files directly in project dir (not in subdirectories)
         if let Ok(files) = fs::read_dir(&project_dir) {
@@ -861,7 +886,7 @@ fn discover_sessions(claude: &Path) -> Vec<(String, PathBuf)> {
                 if path.is_file()
                     && path.extension().map(|e| e == "jsonl").unwrap_or(false)
                 {
-                    results.push((project_name.clone(), path));
+                    results.push((project_name.clone(), path_hash_val.clone(), path));
                 }
             }
         }
@@ -871,15 +896,13 @@ fn discover_sessions(claude: &Path) -> Vec<(String, PathBuf)> {
 }
 
 /// Parse a single session transcript JSONL file into a Session.
-fn parse_session_transcript(filepath: &Path, fallback_project: &str) -> Option<Session> {
+fn parse_session_transcript(filepath: &Path, fallback_project: &str, fallback_path_hash: &str) -> Option<Session> {
     let file = fs::File::open(filepath).ok()?;
     let reader = io::BufReader::new(file);
 
     let mut session = Session::new("unknown");
     session.project = fallback_project.to_string();
-
-    let mut seen_requests: HashSet<String> = HashSet::new();
-    let mut model_map: HashMap<String, (u64, u64, u64, u64, u32)> = HashMap::new(); // model → (in, out, cache_r, cache_w, count)
+    session.path_hash = fallback_path_hash.to_string();
 
     for line_result in reader.lines() {
         let line = match line_result {
@@ -919,26 +942,6 @@ fn parse_session_transcript(filepath: &Path, fallback_project: &str) -> Option<S
             "assistant" => {
                 session.message_count += 1;
 
-                let request_id = evt.get("requestId").and_then(|v| v.as_str()).unwrap_or("");
-                let model = evt.pointer("/message/model").and_then(|v| v.as_str()).unwrap_or("");
-
-                // Token counting: deduplicate by requestId, skip synthetic
-                if !request_id.is_empty()
-                    && model != "<synthetic>"
-                    && !model.is_empty()
-                    && seen_requests.insert(request_id.to_string())
-                {
-                    let usage = evt.pointer("/message/usage");
-                    if let Some(u) = usage {
-                        let entry = model_map.entry(model.to_string()).or_insert((0, 0, 0, 0, 0));
-                        entry.0 += u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                        entry.1 += u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                        entry.2 += u.get("cache_read_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                        entry.3 += u.get("cache_creation_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                        entry.4 += 1;
-                    }
-                }
-
                 // Tool counting from content blocks
                 if let Some(content) = evt.pointer("/message/content").and_then(|v| v.as_array()) {
                     for block in content {
@@ -973,6 +976,9 @@ fn parse_session_transcript(filepath: &Path, fallback_project: &str) -> Option<S
                                 session.project = last.to_string();
                             }
                         }
+                        if session.path_hash.is_empty() {
+                            session.path_hash = hash_path(cwd);
+                        }
                     }
                 }
             }
@@ -985,19 +991,6 @@ fn parse_session_transcript(filepath: &Path, fallback_project: &str) -> Option<S
     if session.session_id == "unknown" && session.message_count == 0 {
         return None;
     }
-
-    // Convert model_map → model_tokens
-    session.model_tokens = model_map
-        .into_iter()
-        .map(|(model, (inp, out, cr, cw, cnt))| ModelTokens {
-            model,
-            input_tokens: inp,
-            output_tokens: out,
-            cache_read_tokens: cr,
-            cache_write_tokens: cw,
-            request_count: cnt,
-        })
-        .collect();
 
     // Set hostname
     session.hostname = gethostname::gethostname()
@@ -1024,7 +1017,7 @@ fn cmd_import_from_history(dir: &Path, project_filter: Option<&str>) -> i32 {
     if let Some(filter) = project_filter {
         let filter_lower = filter.to_lowercase();
         let before = discovered.len();
-        discovered.retain(|(name, _)| name.to_lowercase().contains(&filter_lower));
+        discovered.retain(|(name, _, _)| name.to_lowercase().contains(&filter_lower));
         eprintln!("Filter '{}': {} of {} session files match", filter, discovered.len(), before);
     }
 
@@ -1047,16 +1040,15 @@ fn cmd_import_from_history(dir: &Path, project_filter: Option<&str>) -> i32 {
     let mut total_sessions = 0u32;
     let mut total_prompts = 0u32;
     let mut total_tools = 0u32;
-    let mut total_tokens = 0u64;
     let mut projects: HashSet<String> = HashSet::new();
     let mut earliest = String::new();
     let mut latest = String::new();
 
-    for (i, (project_name, path)) in discovered.iter().enumerate() {
+    for (i, (project_name, ph, path)) in discovered.iter().enumerate() {
         let file_name = path.file_name().unwrap_or_default().to_string_lossy();
         eprint!("\r  [{}/{}] Parsing {}...", i + 1, discovered.len(), file_name);
 
-        let session = match parse_session_transcript(path, project_name) {
+        let session = match parse_session_transcript(path, project_name, ph) {
             Some(s) => s,
             None => continue,
         };
@@ -1066,10 +1058,6 @@ fn cmd_import_from_history(dir: &Path, project_filter: Option<&str>) -> i32 {
         total_prompts += session.prompt_count;
         total_tools += session.tools.values().sum::<u32>();
         projects.insert(session.project.clone());
-
-        for mt in &session.model_tokens {
-            total_tokens += mt.input_tokens + mt.output_tokens + mt.cache_read_tokens + mt.cache_write_tokens;
-        }
 
         if !session.started_at.is_empty() {
             if earliest.is_empty() || session.started_at < earliest {
@@ -1083,7 +1071,8 @@ fn cmd_import_from_history(dir: &Path, project_filter: Option<&str>) -> i32 {
         // Build output JSON
         let mut obj = json!({
             "session_id": session.session_id,
-            "project": session.project,
+            "project_hash": session.path_hash,
+            "project_name": session.project,
             "started_at": session.started_at,
             "ended_at": session.ended_at,
             "prompt_count": session.prompt_count,
@@ -1103,47 +1092,17 @@ fn cmd_import_from_history(dir: &Path, project_filter: Option<&str>) -> i32 {
             obj["duration_seconds"] = json!(end - start);
         }
 
-        if !session.model_tokens.is_empty() {
-            let tokens: Vec<Value> = session
-                .model_tokens
-                .iter()
-                .map(|mt| {
-                    json!({
-                        "model": mt.model,
-                        "input_tokens": mt.input_tokens,
-                        "output_tokens": mt.output_tokens,
-                        "cache_read_tokens": mt.cache_read_tokens,
-                        "cache_write_tokens": mt.cache_write_tokens,
-                        "request_count": mt.request_count,
-                    })
-                })
-                .collect();
-            obj["model_tokens"] = json!(tokens);
-        }
-
         let line = serde_json::to_string(&obj).unwrap_or_default();
         let _ = writeln!(out_file, "{}", line);
     }
 
     eprintln!("\r                                                              ");
 
-    // Format token count
-    let tok_display = if total_tokens >= 1_000_000_000 {
-        format!("{:.1}B", total_tokens as f64 / 1e9)
-    } else if total_tokens >= 1_000_000 {
-        format!("{:.1}M", total_tokens as f64 / 1e6)
-    } else if total_tokens >= 1_000 {
-        format!("{:.1}K", total_tokens as f64 / 1e3)
-    } else {
-        format!("{total_tokens}")
-    };
-
     eprintln!("Done!");
     eprintln!("  Sessions:  {total_sessions}");
     eprintln!("  Projects:  {}", projects.len());
     eprintln!("  Prompts:   {total_prompts}");
     eprintln!("  Tool calls:{total_tools}");
-    eprintln!("  Tokens:    {tok_display}");
     if !earliest.is_empty() {
         eprintln!("  Range:     {} .. {}", &earliest[..10.min(earliest.len())], &latest[..10.min(latest.len())]);
     }
