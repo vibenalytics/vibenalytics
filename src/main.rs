@@ -3,8 +3,8 @@
 /// Single Rust binary. Zero runtime dependencies.
 ///
 /// Usage:
-///   claudnalytics log                                  Read hook JSON from stdin, strip content, append to metrics.jsonl
-///   claudnalytics sync                                 Aggregate + POST + flush
+///   claudnalytics log [--use-transcripts]               Read hook JSON from stdin, strip content, append to metrics.jsonl
+///   claudnalytics sync [--use-transcripts]              Aggregate + POST + flush
 ///   claudnalytics login <email> <password>             Login to get API key
 ///   claudnalytics login --api-key <key>                Set API key directly
 ///   claudnalytics status                               Show registration
@@ -16,7 +16,7 @@ mod tui;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, BufRead, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -25,6 +25,11 @@ use std::collections::hash_map::DefaultHasher;
 
 use chrono::Utc;
 use serde_json::{json, Map, Value};
+
+const DEFAULT_API_BASE: &str = match option_env!("API_BASE") {
+    Some(url) => url,
+    None => "http://localhost:3001/api",
+};
 
 fn hash_path(path: &str) -> String {
     let mut h = DefaultHasher::new();
@@ -84,6 +89,39 @@ fn config_get(dir: &Path, key: &str) -> Option<String> {
         .get(key)?
         .as_str()
         .map(|s| s.to_string())
+}
+
+// ---- Transcript cursor state ----
+
+fn cursors_path(dir: &Path) -> PathBuf {
+    dir.join("transcript-cursors.json")
+}
+
+fn read_cursors(dir: &Path) -> HashMap<String, Value> {
+    let data = match fs::read_to_string(cursors_path(dir)) {
+        Ok(d) => d,
+        Err(_) => return HashMap::new(),
+    };
+    let val: Value = match serde_json::from_str(&data) {
+        Ok(v) => v,
+        Err(_) => return HashMap::new(),
+    };
+    match val {
+        Value::Object(map) => map.into_iter().collect(),
+        _ => HashMap::new(),
+    }
+}
+
+fn write_cursors(dir: &Path, cursors: &HashMap<String, Value>) {
+    let map: serde_json::Map<String, Value> = cursors.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    let val = Value::Object(map);
+    let tmp = cursors_path(dir).with_extension("json.tmp");
+    let target = cursors_path(dir);
+    if let Ok(data) = serde_json::to_string_pretty(&val) {
+        if fs::write(&tmp, &data).is_ok() {
+            let _ = fs::rename(&tmp, &target);
+        }
+    }
 }
 
 // ---- HTTP ----
@@ -282,6 +320,14 @@ struct Session {
     tool_response_sizes: HashMap<String, (u64, u32)>,
     parallel_tool_batches: u32,
     hostname: String,
+    // Token counts (from transcript parsing)
+    total_input_tokens: u64,
+    total_output_tokens: u64,
+    total_cache_read_tokens: u64,
+    total_cache_creation_tokens: u64,
+    total_turn_duration_ms: u64,
+    turn_count: u32,
+    model: String,
 }
 
 impl Session {
@@ -304,6 +350,13 @@ impl Session {
             tool_response_sizes: HashMap::new(),
             parallel_tool_batches: 0,
             hostname: String::new(),
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            total_cache_read_tokens: 0,
+            total_cache_creation_tokens: 0,
+            total_turn_duration_ms: 0,
+            turn_count: 0,
+            model: String::new(),
         }
     }
 }
@@ -556,6 +609,20 @@ fn build_payload(sessions: &[Session]) -> Value {
             if s.parallel_tool_batches > 0 {
                 obj["parallel_tool_batches"] = json!(s.parallel_tool_batches);
             }
+            // Token data (from transcript parsing)
+            if s.total_input_tokens > 0 || s.total_output_tokens > 0 {
+                obj["total_input_tokens"] = json!(s.total_input_tokens);
+                obj["total_output_tokens"] = json!(s.total_output_tokens);
+                obj["total_cache_read_tokens"] = json!(s.total_cache_read_tokens);
+                obj["total_cache_creation_tokens"] = json!(s.total_cache_creation_tokens);
+            }
+            if s.total_turn_duration_ms > 0 {
+                obj["total_turn_duration_ms"] = json!(s.total_turn_duration_ms);
+                obj["turn_count"] = json!(s.turn_count);
+            }
+            if !s.model.is_empty() {
+                obj["model"] = json!(s.model);
+            }
             obj
         })
         .collect();
@@ -577,7 +644,7 @@ fn cmd_aggregate(filepath: &str) -> i32 {
 
 fn cmd_login_with_credentials(dir: &Path, email: &str, password: &str) -> i32 {
     let api = config_get(dir, "apiBase")
-        .unwrap_or_else(|| "http://localhost:3001/api".to_string());
+        .unwrap_or_else(|| DEFAULT_API_BASE.to_string());
 
     println!("Logging in as \"{email}\"...");
 
@@ -668,7 +735,7 @@ fn cmd_login_with_credentials(dir: &Path, email: &str, password: &str) -> i32 {
 
 fn cmd_login_with_key(dir: &Path, api_key: &str) -> i32 {
     let api = config_get(dir, "apiBase")
-        .unwrap_or_else(|| "http://localhost:3001/api".to_string());
+        .unwrap_or_else(|| DEFAULT_API_BASE.to_string());
 
     let cfg = json!({
         "apiBase": api,
@@ -716,6 +783,7 @@ fn cmd_status(dir: &Path) -> i32 {
     println!("  Name:     {}", get("displayName"));
     println!("  API Key:  {}", key_display);
     println!("  API:      {}", get("apiBase"));
+    println!("  Default:  {DEFAULT_API_BASE}");
     0
 }
 
@@ -729,7 +797,7 @@ fn cmd_sync(dir: &Path) -> i32 {
     };
 
     let api_base = config_get(dir, "apiBase")
-        .unwrap_or_else(|| "http://localhost:3001/api".to_string());
+        .unwrap_or_else(|| DEFAULT_API_BASE.to_string());
 
     let mp = metrics_path(dir);
     match fs::metadata(&mp) {
@@ -810,7 +878,7 @@ fn cmd_sync(dir: &Path) -> i32 {
     rc
 }
 
-// ---- Import from history ----
+// ---- Transcript-based log/sync ----
 
 fn claude_dir() -> PathBuf {
     if let Ok(home) = env::var("HOME") {
@@ -819,6 +887,222 @@ fn claude_dir() -> PathBuf {
         PathBuf::from(".claude")
     }
 }
+
+/// Derive the transcript file path from cwd and session_id.
+/// Claude Code stores transcripts at ~/.claude/projects/{cwd_mangled}/{session_id}.jsonl
+/// where cwd_mangled replaces '/' with '-'.
+fn derive_transcript_path(cwd: &str, session_id: &str) -> PathBuf {
+    let mangled = cwd.replace('/', "-");
+    claude_dir()
+        .join("projects")
+        .join(&mangled)
+        .join(format!("{session_id}.jsonl"))
+}
+
+fn cmd_log_transcripts(dir: &Path) -> i32 {
+    let mut input = String::new();
+    if io::stdin().read_to_string(&mut input).is_err() || input.is_empty() {
+        return 0;
+    }
+
+    let evt: Value = match serde_json::from_str(&input) {
+        Ok(v) => v,
+        Err(_) => return 0,
+    };
+
+    let session_id = evt.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
+    let cwd = evt.get("cwd").and_then(|v| v.as_str()).unwrap_or("");
+    let event_name = evt
+        .get("hook_event_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    if session_id.is_empty() || cwd.is_empty() {
+        return 0;
+    }
+
+    // Derive transcript path (prefer transcript_path from hook, fallback to derivation)
+    let transcript_path = evt
+        .get("transcript_path")
+        .and_then(|v| v.as_str())
+        .map(|s| PathBuf::from(s))
+        .unwrap_or_else(|| derive_transcript_path(cwd, session_id));
+
+    let transcript_key = transcript_path.to_string_lossy().to_string();
+
+    // Compute project identity
+    let path_hash_val = hash_path(cwd);
+    let project_name = cwd
+        .rsplit('/')
+        .find(|s| !s.is_empty())
+        .unwrap_or("unknown");
+
+    // Upsert cursor entry for this session
+    let mut cursors = read_cursors(dir);
+    if !cursors.contains_key(&transcript_key) {
+        cursors.insert(
+            transcript_key,
+            json!({
+                "byte_offset": 0,
+                "session_id": session_id,
+                "project": project_name,
+                "path_hash": path_hash_val,
+                "last_request_id": "",
+                "last_output_tokens": 0
+            }),
+        );
+        write_cursors(dir, &cursors);
+    }
+
+    // Auto-sync on boundary events
+    if SYNC_EVENTS.contains(&event_name) {
+        cmd_sync_transcripts(dir);
+    }
+
+    0
+}
+
+fn cmd_sync_transcripts(dir: &Path) -> i32 {
+    let api_key = match config_get(dir, "apiKey") {
+        Some(key) => key,
+        None => {
+            sync_log(dir, "[transcripts] No API key configured — skipping sync");
+            return 0;
+        }
+    };
+
+    let api_base =
+        config_get(dir, "apiBase").unwrap_or_else(|| DEFAULT_API_BASE.to_string());
+
+    let mut cursors = read_cursors(dir);
+    if cursors.is_empty() {
+        return 0;
+    }
+
+    // Lock file
+    let lock = cursors_path(dir).with_extension("json.lock");
+    if lock.exists() {
+        if let Ok(lm) = fs::metadata(&lock) {
+            if let Ok(age) = lm
+                .modified()
+                .unwrap_or(SystemTime::UNIX_EPOCH)
+                .elapsed()
+            {
+                if age.as_secs() < 60 {
+                    return 0;
+                }
+            }
+        }
+        let _ = fs::remove_file(&lock);
+    }
+    let _ = fs::write(&lock, format!("{}", std::process::id()));
+
+    let mut sessions: Vec<Session> = Vec::new();
+    let mut updated_cursors: Vec<(String, Value)> = Vec::new();
+
+    for (transcript_key, cursor_val) in &cursors {
+        let transcript_path = Path::new(transcript_key.as_str());
+        if !transcript_path.exists() {
+            continue;
+        }
+
+        let byte_offset = cursor_val
+            .get("byte_offset")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let prev_request_id = cursor_val
+            .get("last_request_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let prev_output_tokens = cursor_val
+            .get("last_output_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let fallback_project = cursor_val
+            .get("project")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let fallback_path_hash = cursor_val
+            .get("path_hash")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        // Check if transcript has grown
+        let file_size = fs::metadata(transcript_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        if file_size <= byte_offset {
+            continue;
+        }
+
+        if let Some((session, new_offset, last_rid, last_out)) = parse_transcript_from_offset(
+            transcript_path,
+            byte_offset,
+            prev_request_id,
+            prev_output_tokens,
+            fallback_project,
+            fallback_path_hash,
+        ) {
+            sessions.push(session);
+            updated_cursors.push((
+                transcript_key.clone(),
+                json!({
+                    "byte_offset": new_offset,
+                    "session_id": cursor_val.get("session_id").and_then(|v| v.as_str()).unwrap_or(""),
+                    "project": cursor_val.get("project").and_then(|v| v.as_str()).unwrap_or("unknown"),
+                    "path_hash": cursor_val.get("path_hash").and_then(|v| v.as_str()).unwrap_or(""),
+                    "last_request_id": last_rid,
+                    "last_output_tokens": last_out
+                }),
+            ));
+        }
+    }
+
+    if sessions.is_empty() {
+        let _ = fs::remove_file(&lock);
+        return 0;
+    }
+
+    let payload = build_payload(&sessions);
+    let payload_str = serde_json::to_string(&payload).unwrap_or_default();
+    let n = sessions.len();
+
+    sync_log(
+        dir,
+        &format!("[transcripts] Syncing {n} sessions to {api_base}/sync"),
+    );
+
+    let url = format!("{api_base}/sync");
+    let result = http_post(&url, &payload_str, Some(&api_key));
+
+    let rc = match result {
+        Ok((200, resp)) => {
+            sync_log(dir, &format!("[transcripts] Sync OK: {resp}"));
+            // Update cursors on success
+            for (key, val) in updated_cursors {
+                cursors.insert(key, val);
+            }
+            write_cursors(dir, &cursors);
+            0
+        }
+        Ok((code, resp)) => {
+            sync_log(
+                dir,
+                &format!("[transcripts] Sync FAILED (HTTP {code}): {resp}"),
+            );
+            1
+        }
+        Err(e) => {
+            sync_log(dir, &format!("[transcripts] Sync FAILED: {e}"));
+            1
+        }
+    };
+
+    let _ = fs::remove_file(&lock);
+    rc
+}
+
+// ---- Import from history ----
 
 /// Parse ISO 8601 timestamp with optional milliseconds: "2026-01-31T18:15:00.104Z" or "2026-01-31T18:15:00Z"
 fn parse_iso_flex(ts: &str) -> Option<i64> {
@@ -981,6 +1265,209 @@ fn parse_session_transcript(filepath: &Path, fallback_project: &str, fallback_pa
     Some(session)
 }
 
+/// Accumulator for deduplicating token usage across streaming chunks sharing a requestId.
+struct UsageAccum {
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_tokens: u64,
+    cache_creation_tokens: u64,
+}
+
+/// Parse a transcript file from a byte offset, returning a Session delta and new cursor state.
+/// Returns (session_delta, new_byte_offset, last_request_id, last_output_tokens).
+fn parse_transcript_from_offset(
+    filepath: &Path,
+    byte_offset: u64,
+    prev_request_id: &str,
+    prev_output_tokens: u64,
+    fallback_project: &str,
+    fallback_path_hash: &str,
+) -> Option<(Session, u64, String, u64)> {
+    let file_size = fs::metadata(filepath).ok()?.len();
+
+    // If file shrank (rewrite/compaction), reset to start
+    let start_offset = if file_size < byte_offset { 0 } else { byte_offset };
+
+    let mut file = fs::File::open(filepath).ok()?;
+    file.seek(io::SeekFrom::Start(start_offset)).ok()?;
+    let reader = io::BufReader::new(file);
+
+    let mut session = Session::new("unknown");
+    session.project = fallback_project.to_string();
+    session.path_hash = fallback_path_hash.to_string();
+
+    // Track usage per requestId for deduplication
+    let mut usage_map: HashMap<String, UsageAccum> = HashMap::new();
+    let mut last_request_id = String::new();
+    let mut current_offset = start_offset;
+    let mut lines_parsed = 0u32;
+
+    for line_result in reader.lines() {
+        let line = match line_result {
+            Ok(l) => l,
+            Err(_) => break, // incomplete line at EOF — stop, don't advance offset
+        };
+        let line_bytes = line.len() as u64 + 1; // +1 for newline
+
+        if line.trim().is_empty() {
+            current_offset += line_bytes;
+            continue;
+        }
+
+        let evt: Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => {
+                // Could be an incomplete write — don't advance past it
+                break;
+            }
+        };
+
+        current_offset += line_bytes;
+        lines_parsed += 1;
+
+        let msg_type = evt.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+        // Track session ID
+        if session.session_id == "unknown" {
+            if let Some(sid) = evt.get("sessionId").and_then(|v| v.as_str()) {
+                session.session_id = sid.to_string();
+            }
+        }
+
+        // Track timestamps
+        if let Some(ts) = evt.get("timestamp").and_then(|v| v.as_str()) {
+            if session.started_at.is_empty() || ts < session.started_at.as_str() {
+                session.started_at = ts.to_string();
+            }
+            if session.ended_at.is_empty() || ts > session.ended_at.as_str() {
+                session.ended_at = ts.to_string();
+            }
+        }
+
+        match msg_type {
+            "assistant" => {
+                session.message_count += 1;
+
+                // Extract model
+                if let Some(model) = evt.pointer("/message/model").and_then(|v| v.as_str()) {
+                    if session.model.is_empty() || !model.is_empty() {
+                        session.model = model.to_string();
+                    }
+                }
+
+                // Extract requestId and usage for token dedup
+                let request_id = evt.get("requestId").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                if let Some(usage) = evt.pointer("/message/usage") {
+                    let out_tok = usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let entry = usage_map.entry(request_id.clone()).or_insert_with(|| UsageAccum {
+                        input_tokens: usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                        cache_read_tokens: usage.get("cache_read_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                        cache_creation_tokens: usage.get("cache_creation_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                        output_tokens: 0,
+                    });
+                    // output_tokens grows across streaming chunks — take max
+                    if out_tok > entry.output_tokens {
+                        entry.output_tokens = out_tok;
+                    }
+                }
+                if !request_id.is_empty() {
+                    last_request_id = request_id;
+                }
+
+                // Tool counting from content blocks
+                if let Some(content) = evt.pointer("/message/content").and_then(|v| v.as_array()) {
+                    for block in content {
+                        if block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
+                            let tool = block.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
+                            *session.tools.entry(tool.to_string()).or_insert(0) += 1;
+                        }
+                    }
+                }
+            }
+
+            "user" => {
+                session.message_count += 1;
+
+                // Real prompt = content is string; tool result = content is array
+                let is_prompt = evt
+                    .pointer("/message/content")
+                    .map(|v| v.is_string())
+                    .unwrap_or(false);
+                if is_prompt {
+                    session.prompt_count += 1;
+                }
+
+                // Extract metadata
+                if let Some(pm) = evt.get("permissionMode").and_then(|v| v.as_str()) {
+                    session.permission_mode = pm.to_string();
+                }
+                if session.project == "unknown" {
+                    if let Some(cwd) = evt.get("cwd").and_then(|v| v.as_str()) {
+                        if let Some(last) = cwd.rsplit('/').next() {
+                            if !last.is_empty() {
+                                session.project = last.to_string();
+                            }
+                        }
+                        if session.path_hash.is_empty() {
+                            session.path_hash = hash_path(cwd);
+                        }
+                    }
+                }
+            }
+
+            "system" => {
+                let subtype = evt.get("subtype").and_then(|v| v.as_str()).unwrap_or("");
+                if subtype == "turn_duration" {
+                    if let Some(ms) = evt.get("durationMs").and_then(|v| v.as_u64()) {
+                        session.total_turn_duration_ms += ms;
+                        session.turn_count += 1;
+                    }
+                }
+            }
+
+            _ => {} // progress, file-history-snapshot, queue-operation, summary — skip
+        }
+    }
+
+    if lines_parsed == 0 {
+        return None;
+    }
+
+    // Resolve token totals from usage_map
+    for (rid, accum) in &usage_map {
+        let mut out = accum.output_tokens;
+        // Handle requestId that spans cursor boundary: subtract previously counted output_tokens
+        if rid == prev_request_id && !prev_request_id.is_empty() {
+            if out > prev_output_tokens {
+                out -= prev_output_tokens;
+            } else {
+                out = 0; // same or lower — already fully counted
+            }
+            // input/cache tokens were already counted in previous read, skip them
+        } else {
+            session.total_input_tokens += accum.input_tokens;
+            session.total_cache_read_tokens += accum.cache_read_tokens;
+            session.total_cache_creation_tokens += accum.cache_creation_tokens;
+        }
+        session.total_output_tokens += out;
+    }
+
+    // Set hostname
+    session.hostname = gethostname::gethostname()
+        .to_string_lossy()
+        .split('.')
+        .next()
+        .unwrap_or("unknown")
+        .to_string();
+
+    let last_out = usage_map
+        .get(&last_request_id)
+        .map(|a| a.output_tokens)
+        .unwrap_or(0);
+
+    Some((session, current_offset, last_request_id, last_out))
+}
+
 fn post_import_batch(api_base: &str, api_key: &str, sessions: &[Value]) -> Result<(u32, u32), String> {
     let payload = json!({ "sessions": sessions });
     let payload_str = serde_json::to_string(&payload).map_err(|e| format!("{e}"))?;
@@ -1111,7 +1598,7 @@ fn cmd_import_from_history(dir: &Path, project_filter: Option<&str>, do_sync: bo
             }
         };
         let api_base = config_get(dir, "apiBase")
-            .unwrap_or_else(|| "http://localhost:3001/api".to_string());
+            .unwrap_or_else(|| DEFAULT_API_BASE.to_string());
 
         eprintln!("\nSyncing to {}...", api_base);
 
@@ -1153,20 +1640,32 @@ fn main() {
 
     if args.len() < 2 {
         eprintln!("Usage:");
-        eprintln!("  claudnalytics log                            Log hook event from stdin");
-        eprintln!("  claudnalytics sync                           Sync metrics to backend");
-        eprintln!("  claudnalytics login <email> <password>       Login to get API key");
-        eprintln!("  claudnalytics login --api-key <key>          Set API key directly");
-        eprintln!("  claudnalytics status                         Show configuration");
-        eprintln!("  claudnalytics aggregate <file>               Output aggregated JSON");
-        eprintln!("  claudnalytics tui                            Interactive TUI dashboard");
+        eprintln!("  claudnalytics log [--use-transcripts]         Log hook event from stdin");
+        eprintln!("  claudnalytics sync [--use-transcripts]        Sync metrics to backend");
+        eprintln!("  claudnalytics login <email> <password>        Login to get API key");
+        eprintln!("  claudnalytics login --api-key <key>           Set API key directly");
+        eprintln!("  claudnalytics status                          Show configuration");
+        eprintln!("  claudnalytics aggregate <file>                Output aggregated JSON");
+        eprintln!("  claudnalytics tui                             Interactive TUI dashboard");
         eprintln!("  claudnalytics import-from-history [project] [--sync]  Parse transcripts + sync to backend");
         std::process::exit(1);
     }
 
     let rc = match args[1].as_str() {
-        "log" => cmd_log(&dir),
-        "sync" => cmd_sync(&dir),
+        "log" => {
+            if args.iter().any(|a| a == "--use-transcripts") {
+                cmd_log_transcripts(&dir)
+            } else {
+                cmd_log(&dir)
+            }
+        }
+        "sync" => {
+            if args.iter().any(|a| a == "--use-transcripts") {
+                cmd_sync_transcripts(&dir)
+            } else {
+                cmd_sync(&dir)
+            }
+        }
         "login" => {
             if args.len() >= 4 && args[2] == "--api-key" {
                 cmd_login_with_key(&dir, &args[3])
