@@ -5,18 +5,20 @@
 /// Usage:
 ///   claudnalytics log [--use-transcripts]               Read hook JSON from stdin, strip content, append to metrics.jsonl
 ///   claudnalytics sync [--use-transcripts]              Aggregate + POST + flush
-///   claudnalytics login <email> <password>             Login to get API key
+///   claudnalytics login                                Browser-based login (opens browser)
+///   claudnalytics login <email> <password>             Login with credentials
 ///   claudnalytics login --api-key <key>                Set API key directly
 ///   claudnalytics status                               Show registration
 ///   claudnalytics aggregate <file>                     Dump aggregated JSON to stdout
 ///   claudnalytics tui                                  Launch interactive TUI dashboard
-///   claudnalytics import-from-history [project] [--sync]  Parse ~/.claude/ transcripts → JSONL (+ sync)
+///   claudnalytics import-from-history [project] [--dry]   Parse ~/.claude/ transcripts → sync (or --dry for JSONL only)
 
 mod tui;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, Read, Seek, Write};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -29,6 +31,11 @@ use serde_json::{json, Map, Value};
 const DEFAULT_API_BASE: &str = match option_env!("API_BASE") {
     Some(url) => url,
     None => "http://localhost:3001/api",
+};
+
+const DEFAULT_FRONTEND_BASE: &str = match option_env!("FRONTEND_BASE") {
+    Some(url) => url,
+    None => "http://localhost:3000",
 };
 
 fn hash_path(path: &str) -> String {
@@ -754,6 +761,161 @@ fn cmd_login_with_key(dir: &Path, api_key: &str) -> i32 {
 
     sync_log(dir, "API key configured directly");
     0
+}
+
+fn frontend_url(dir: &Path) -> String {
+    config_get(dir, "frontendBase")
+        .unwrap_or_else(|| DEFAULT_FRONTEND_BASE.to_string())
+}
+
+fn cmd_login_browser(dir: &Path) -> i32 {
+    let api = config_get(dir, "apiBase")
+        .unwrap_or_else(|| DEFAULT_API_BASE.to_string());
+
+    // Step 1: Bind a one-shot TCP listener on a random localhost port
+    let listener = match TcpListener::bind("127.0.0.1:0") {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("Failed to bind localhost port: {e}");
+            return 1;
+        }
+    };
+    let port = listener.local_addr().unwrap().port();
+
+    // Step 2: Open browser
+    let frontend = frontend_url(dir);
+    let auth_url = format!("{frontend}/auth/cli?port={port}");
+
+    eprintln!("Opening browser for authentication...\n");
+    if let Err(e) = open::that(&auth_url) {
+        eprintln!("Could not open browser: {e}");
+    }
+    eprintln!("If the browser didn't open, visit this URL:");
+    eprintln!("  {auth_url}\n");
+    eprintln!("Waiting for authorization (press Ctrl+C to cancel)...");
+
+    // Step 3: Set timeout and wait for the callback
+    listener.set_nonblocking(true).ok();
+    let timeout = std::time::Duration::from_secs(300); // 5 minutes
+    let start = std::time::Instant::now();
+    let poll_interval = std::time::Duration::from_millis(200);
+
+    let stream = loop {
+        if start.elapsed() > timeout {
+            eprintln!("\nTimed out waiting for authorization.");
+            return 1;
+        }
+        match listener.accept() {
+            Ok((stream, _)) => break stream,
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(poll_interval);
+                continue;
+            }
+            Err(e) => {
+                eprintln!("\nConnection error: {e}");
+                return 1;
+            }
+        }
+    };
+
+    // Step 4: Read the HTTP request
+    stream.set_nonblocking(false).ok();
+    let mut reader = io::BufReader::new(&stream);
+    let mut request_line = String::new();
+    if reader.read_line(&mut request_line).is_err() {
+        eprintln!("Failed to read request");
+        return 1;
+    }
+
+    // Parse: GET /callback?key=...&name=... HTTP/1.1
+    let api_key;
+    let user_name;
+    if let Some(path) = request_line.split_whitespace().nth(1) {
+        let query = path.splitn(2, '?').nth(1).unwrap_or("");
+        let params: HashMap<String, String> = query
+            .split('&')
+            .filter_map(|p| {
+                let mut kv = p.splitn(2, '=');
+                Some((kv.next()?.to_string(), urldecode(kv.next().unwrap_or(""))))
+            })
+            .collect();
+        api_key = params.get("key").cloned().unwrap_or_default();
+        user_name = params.get("name").cloned().unwrap_or_else(|| "user".to_string());
+    } else {
+        eprintln!("Invalid request");
+        return 1;
+    }
+
+    // Step 5: Send success HTML response
+    let html = r#"<!DOCTYPE html><html><head><meta charset="utf-8"><title>Claudnalytics</title>
+<style>body{font-family:system-ui;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;background:#1a1a2e;color:#e0e0e0}
+.card{text-align:center;padding:2rem;border-radius:12px;background:#252540;border:1px solid #333}.ok{color:#c97856;font-size:1.5rem;margin-bottom:0.5rem}</style>
+</head><body><div class="card"><div class="ok">CLI Authorized!</div><p>You can close this tab and return to your terminal.</p></div></body></html>"#;
+
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        html.len(),
+        html
+    );
+
+    let _ = (&stream).write_all(response.as_bytes());
+    let _ = (&stream).flush();
+    drop(stream);
+
+    if api_key.is_empty() {
+        eprintln!("\nNo API key received.");
+        return 1;
+    }
+
+    // Step 6: Save config
+    let cfg = json!({
+        "apiBase": api,
+        "apiKey": api_key,
+        "displayName": user_name,
+    });
+
+    if let Err(e) = write_config(dir, &cfg) {
+        eprintln!("Failed to write config: {e}");
+        return 1;
+    }
+
+    eprintln!("\nAuthorized! Logged in successfully.");
+    eprintln!("  Name:     {user_name}");
+    eprintln!(
+        "  API Key:  {}...{}",
+        &api_key[..8.min(api_key.len())],
+        &api_key[api_key.len().saturating_sub(4)..]
+    );
+    eprintln!("\nSync will now use this identity automatically.");
+
+    sync_log(dir, &format!("Browser login: {user_name}"));
+    0
+}
+
+fn urldecode(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.bytes();
+    while let Some(b) = chars.next() {
+        match b {
+            b'%' => {
+                let hi = chars.next().unwrap_or(b'0');
+                let lo = chars.next().unwrap_or(b'0');
+                let hex = [hi, lo];
+                if let Ok(s) = std::str::from_utf8(&hex) {
+                    if let Ok(val) = u8::from_str_radix(s, 16) {
+                        result.push(val as char);
+                        continue;
+                    }
+                }
+                result.push('%');
+                result.push(hi as char);
+                result.push(lo as char);
+            }
+            b'+' => result.push(' '),
+            _ => result.push(b as char),
+        }
+    }
+    result
 }
 
 fn cmd_status(dir: &Path) -> i32 {
@@ -1642,12 +1804,13 @@ fn main() {
         eprintln!("Usage:");
         eprintln!("  claudnalytics log [--use-transcripts]         Log hook event from stdin");
         eprintln!("  claudnalytics sync [--use-transcripts]        Sync metrics to backend");
-        eprintln!("  claudnalytics login <email> <password>        Login to get API key");
+        eprintln!("  claudnalytics login                          Browser-based login");
+        eprintln!("  claudnalytics login <email> <password>        Login with credentials");
         eprintln!("  claudnalytics login --api-key <key>           Set API key directly");
         eprintln!("  claudnalytics status                          Show configuration");
         eprintln!("  claudnalytics aggregate <file>                Output aggregated JSON");
         eprintln!("  claudnalytics tui                             Interactive TUI dashboard");
-        eprintln!("  claudnalytics import-from-history [project] [--sync]  Parse transcripts + sync to backend");
+        eprintln!("  claudnalytics import-from-history [project] [--dry]   Parse transcripts + sync (--dry = JSONL only)");
         std::process::exit(1);
     }
 
@@ -1672,10 +1835,7 @@ fn main() {
             } else if args.len() >= 4 {
                 cmd_login_with_credentials(&dir, &args[2], &args[3])
             } else {
-                eprintln!("Usage:");
-                eprintln!("  claudnalytics login <email> <password>");
-                eprintln!("  claudnalytics login --api-key <key>");
-                1
+                cmd_login_browser(&dir)
             }
         }
         "status" => cmd_status(&dir),
@@ -1689,15 +1849,15 @@ fn main() {
         "tui" => tui::run(&dir),
         "import-from-history" => {
             let mut filter: Option<&str> = None;
-            let mut do_sync = false;
+            let mut dry_run = false;
             for arg in &args[2..] {
                 match arg.as_str() {
-                    "--sync" => do_sync = true,
+                    "--dry" => dry_run = true,
                     other if filter.is_none() => filter = Some(other),
                     _ => {}
                 }
             }
-            cmd_import_from_history(&dir, filter, do_sync)
+            cmd_import_from_history(&dir, filter, !dry_run)
         }
         other => {
             eprintln!("Unknown command: {other}");
