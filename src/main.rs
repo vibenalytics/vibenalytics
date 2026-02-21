@@ -14,6 +14,7 @@ mod projects;
 mod sync;
 mod transcripts;
 mod tui;
+mod update;
 
 use clap::{Parser, Subcommand};
 use std::env;
@@ -87,6 +88,9 @@ enum Commands {
         #[arg(long)]
         dry: bool,
     },
+
+    /// Update to the latest version
+    Update,
 
     /// (internal) Hook handler — reads event JSON from stdin
     #[command(hide = true)]
@@ -310,6 +314,8 @@ fn main() {
         Some(Commands::Import { project, dry }) => {
             import::cmd_import(&dir, project.as_deref(), !dry)
         }
+
+        Some(Commands::Update) => update::cmd_update(),
 
         Some(Commands::Log { use_transcripts }) => {
             if use_transcripts {
