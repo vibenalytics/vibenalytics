@@ -9,6 +9,11 @@ pub const DEFAULT_API_BASE: &str = match option_env!("API_BASE") {
     None => "http://localhost:3001/api",
 };
 
+pub const DEFAULT_FRONTEND_BASE: &str = match option_env!("FRONTEND_BASE") {
+    Some(url) => url,
+    None => "http://localhost:3000",
+};
+
 
 pub fn read_config(dir: &Path) -> Option<Value> {
     let data = fs::read_to_string(config_path(dir)).ok()?;

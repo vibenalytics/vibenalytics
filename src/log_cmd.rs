@@ -118,9 +118,15 @@ pub fn cmd_log(dir: &Path) -> i32 {
     obj.remove("transcript_path");
 
     if let Some(Value::String(cwd)) = obj.remove("cwd") {
-        obj.insert("path_hash".to_string(), json!(hash_path(&cwd)));
+        let ph = hash_path(&cwd);
+        // Allow SessionStart through (for project registration), block everything else if disabled
+        if event_name != "SessionStart" && crate::projects::is_project_enabled(dir, &ph) == Some(false) {
+            return 0;
+        }
+        obj.insert("path_hash".to_string(), json!(ph));
         let project_name = cwd.rsplit('/').find(|s| !s.is_empty()).unwrap_or("unknown");
         obj.insert("project".to_string(), json!(project_name));
+        obj.insert("_cwd".to_string(), json!(cwd));
     }
 
     if event_name == "UserPromptSubmit" {

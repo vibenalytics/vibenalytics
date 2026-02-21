@@ -1,7 +1,7 @@
 use ratatui::prelude::*;
 use super::theme;
 
-pub const ACTIONS: &[&str] = &["Re-authenticate", "Force Sync", "Import History"];
+pub const ACTION_COUNT: usize = 4;
 
 pub struct SettingsState {
     pub selected: usize,
@@ -18,31 +18,44 @@ impl SettingsState {
         self.selected = self.selected.saturating_sub(1);
     }
     pub fn down(&mut self) {
-        if self.selected + 1 < ACTIONS.len() {
+        if self.selected + 1 < ACTION_COUNT {
             self.selected += 1;
         }
     }
 }
 
-pub fn render(frame: &mut Frame, area: Rect, state: &SettingsState, user_name: &str, connected: bool, pending_events: usize) {
+pub fn render(frame: &mut Frame, area: Rect, state: &SettingsState, user_name: &str, connected: bool, pending_events: usize, default_enabled: bool) {
     let status_style = if connected { theme::success() } else { theme::dim() };
     let dot = if connected { "●" } else { "○" };
+
+    let sync_mode = if default_enabled { "auto (all projects)" } else { "manual (whitelist)" };
 
     let mut lines = vec![
         Line::from(""),
         Line::from(vec![
-            Span::styled("  Account  ", theme::dim()),
+            Span::styled("  Account    ", theme::dim()),
             Span::styled(dot, status_style),
             Span::styled(format!(" {user_name}"), theme::text()),
         ]),
         Line::from(vec![
-            Span::styled("  Pending  ", theme::dim()),
+            Span::styled("  Sync mode  ", theme::dim()),
+            Span::styled(sync_mode, theme::text()),
+        ]),
+        Line::from(vec![
+            Span::styled("  Pending    ", theme::dim()),
             Span::styled(format!("{pending_events} events"), theme::text()),
         ]),
         Line::from(""),
     ];
 
-    for (i, action) in ACTIONS.iter().enumerate() {
+    let actions = [
+        "Re-authenticate",
+        "Force Sync",
+        "Import History",
+        if default_enabled { "Switch to manual mode" } else { "Switch to auto mode" },
+    ];
+
+    for (i, action) in actions.iter().enumerate() {
         let (marker, style) = if i == state.selected {
             ("> ", theme::accent_bold())
         } else {

@@ -43,29 +43,8 @@ fn format_last_active(ts: Option<SystemTime>) -> String {
         Some(t) => t,
         None => return "—".to_string(),
     };
-    let elapsed = match st.elapsed() {
-        Ok(d) => d,
-        Err(_) => return "just now".to_string(),
-    };
-    let secs = elapsed.as_secs();
-    if secs < 60 {
-        "just now".to_string()
-    } else if secs < 3600 {
-        let m = secs / 60;
-        format!("{m}m ago")
-    } else if secs < 86400 {
-        let h = secs / 3600;
-        format!("{h}h ago")
-    } else if secs < 86400 * 30 {
-        let d = secs / 86400;
-        format!("{d}d ago")
-    } else if secs < 86400 * 365 {
-        let mo = secs / (86400 * 30);
-        format!("{mo}mo ago")
-    } else {
-        let y = secs / (86400 * 365);
-        format!("{y}y ago")
-    }
+    let secs = st.elapsed().map(|d| d.as_secs()).unwrap_or(0);
+    super::projects::format_elapsed_secs(secs)
 }
 
 impl ImportPickerState {

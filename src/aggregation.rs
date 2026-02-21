@@ -21,6 +21,7 @@ pub struct Session {
     pub session_id: String,
     pub project: String,
     pub path_hash: String,
+    pub project_path: String,
     pub started_at: String,
     pub ended_at: String,
     pub permission_mode: String,
@@ -44,12 +45,19 @@ pub struct Session {
     pub model: String,
 }
 
+impl crate::projects::HasProjectHash for Session {
+    fn path_hash(&self) -> &str { &self.path_hash }
+    fn project_name(&self) -> &str { &self.project }
+    fn project_path(&self) -> &str { &self.project_path }
+}
+
 impl Session {
     pub fn new(id: &str) -> Self {
         Session {
             session_id: id.to_string(),
             project: "unknown".to_string(),
             path_hash: String::new(),
+            project_path: String::new(),
             started_at: String::new(),
             ended_at: String::new(),
             permission_mode: String::new(),
@@ -145,6 +153,12 @@ pub fn aggregate_file(filepath: &Path) -> Vec<Session> {
         if let Some(proj) = evt.get("project").and_then(|v| v.as_str()) {
             if proj != "unknown" {
                 s.project = proj.to_string();
+            }
+        }
+
+        if s.project_path.is_empty() {
+            if let Some(cwd) = evt.get("_cwd").and_then(|v| v.as_str()) {
+                s.project_path = cwd.to_string();
             }
         }
 

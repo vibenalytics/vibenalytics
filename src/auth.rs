@@ -5,7 +5,7 @@ use std::net::TcpListener;
 use std::path::Path;
 use std::time::SystemTime;
 use serde_json::json;
-use crate::config::{write_config, DEFAULT_API_BASE};
+use crate::config::{write_config, DEFAULT_FRONTEND_BASE};
 use crate::paths::{sync_log, config_path};
 
 pub fn generate_nonce() -> String {
@@ -63,7 +63,7 @@ pub fn start_login() -> Result<LoginListener, String> {
     let port = listener.local_addr().unwrap().port();
     let nonce = generate_nonce();
 
-    let auth_url = format!("{DEFAULT_API_BASE}/auth/github?port={port}&state={nonce}");
+    let auth_url = format!("{DEFAULT_FRONTEND_BASE}/auth/cli?port={port}&state={nonce}");
     let _ = open::that(&auth_url);
 
     listener.set_nonblocking(true).ok();
@@ -150,7 +150,7 @@ pub fn cmd_login(dir: &Path) -> i32 {
     };
 
     let port = login.listener.local_addr().unwrap().port();
-    let auth_url = format!("{DEFAULT_API_BASE}/auth/github?port={port}&state={}", login.nonce);
+    let auth_url = format!("{DEFAULT_FRONTEND_BASE}/auth/cli?port={port}&state={}", login.nonce);
     eprintln!("Opening browser for authentication...\n");
     eprintln!("If the browser didn't open, visit this URL:");
     eprintln!("  {auth_url}\n");

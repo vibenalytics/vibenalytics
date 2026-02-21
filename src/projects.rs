@@ -20,6 +20,8 @@ pub struct ProjectRegistry {
     pub projects: Vec<ProjectEntry>,
     #[serde(default)]
     pub default_enabled: bool,
+    #[serde(default)]
+    pub onboarding_completed: bool,
 }
 
 impl Default for ProjectRegistry {
@@ -27,6 +29,7 @@ impl Default for ProjectRegistry {
         ProjectRegistry {
             projects: Vec::new(),
             default_enabled: false,
+            onboarding_completed: false,
         }
     }
 }
@@ -70,7 +73,8 @@ pub fn find_project<'a>(registry: &'a ProjectRegistry, name_or_cwd: &str) -> Opt
     registry.projects.iter().position(|p| p.path_hash == ph)
 }
 
-/// Add a project to the registry. Returns Ok(name) on success, Err(message) on failure.
+/// Add a project to the registry. Always enabled (explicit user action).
+/// Returns Ok(name) on success, Err(message) on failure.
 pub fn add_project(dir: &Path, project_path: &str) -> Result<String, String> {
     let canonical = fs::canonicalize(project_path)
         .map(|p| p.to_string_lossy().to_string())
@@ -93,7 +97,7 @@ pub fn add_project(dir: &Path, project_path: &str) -> Result<String, String> {
         name: name.clone(),
         path: canonical.clone(),
         path_hash: ph,
-        enabled: true,
+        enabled: true, // explicit add = always enabled
         added_at: Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
     });
 
@@ -138,4 +142,86 @@ pub fn disable_project(dir: &Path, name_or_cwd: &str) -> Result<String, String> 
     let name = registry.projects[idx].name.clone();
     write_projects(dir, &registry).map_err(|e| format!("{e}"))?;
     Ok(name)
+}
+
+/// Filter sessions by project enabled state, auto-registering new projects in auto mode.
+/// Returns the filtered sessions.
+pub fn filter_sessions_by_enabled<S: HasProjectHash>(dir: &Path, mut sessions: Vec<S>) -> Vec<S> {
+    let mut registry = read_projects(dir);
+
+    let enabled_hashes: std::collections::HashSet<String> = registry.projects.iter()
+        .filter(|p| p.enabled)
+        .map(|p| p.path_hash.clone())
+        .collect();
+    let disabled_hashes: std::collections::HashSet<String> = registry.projects.iter()
+        .filter(|p| !p.enabled)
+        .map(|p| p.path_hash.clone())
+        .collect();
+
+    let mut new_projects: Vec<(String, String, String, bool)> = Vec::new(); // (name, path_hash, path, enabled)
+
+    sessions.retain(|s| {
+        let ph = s.path_hash();
+        let name = s.project_name();
+        if ph.is_empty() { return true; }
+        if disabled_hashes.contains(ph) { return false; }
+        if enabled_hashes.contains(ph) { return true; }
+        // Unregistered project — always register, enabled state follows default_enabled
+        new_projects.push((name.to_string(), ph.to_string(), s.project_path().to_string(), registry.default_enabled));
+        registry.default_enabled // only sync if auto mode
+    });
+
+    // Register newly discovered projects
+    if !new_projects.is_empty() {
+        let now = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        for (name, ph, path, enabled) in &new_projects {
+            if !registry.projects.iter().any(|p| p.path_hash == *ph) {
+                registry.projects.push(ProjectEntry {
+                    name: name.clone(),
+                    path: path.clone(),
+                    path_hash: ph.clone(),
+                    enabled: *enabled,
+                    added_at: now.clone(),
+                });
+            }
+        }
+        let _ = write_projects(dir, &registry);
+    }
+
+    sessions
+}
+
+/// Trait for types that carry project hash and name (used by filter_sessions_by_enabled).
+pub trait HasProjectHash {
+    fn path_hash(&self) -> &str;
+    fn project_name(&self) -> &str;
+    fn project_path(&self) -> &str { "" }
+}
+
+/// Register multiple discovered projects at once (used by onboarding).
+/// Each tuple: (name, path, path_hash, enabled).
+pub fn register_projects_bulk(
+    dir: &Path,
+    selections: &[(String, String, String, bool)],
+    default_enabled: bool,
+) -> Result<(), String> {
+    let mut registry = read_projects(dir);
+    let now = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+
+    for (name, path, path_hash, enabled) in selections {
+        if registry.projects.iter().any(|p| p.path_hash == *path_hash) {
+            continue;
+        }
+        registry.projects.push(ProjectEntry {
+            name: name.clone(),
+            path: path.clone(),
+            path_hash: path_hash.clone(),
+            enabled: *enabled,
+            added_at: now.clone(),
+        });
+    }
+
+    registry.default_enabled = default_enabled;
+    registry.onboarding_completed = true;
+    write_projects(dir, &registry).map_err(|e| format!("Failed to write projects.json: {e}"))
 }

@@ -53,6 +53,8 @@ pub fn cmd_sync(dir: &Path) -> i32 {
     let _ = fs::write(&lock, format!("{}", std::process::id()));
 
     let sessions = aggregate_file(&mp);
+    let sessions = crate::projects::filter_sessions_by_enabled(dir, sessions);
+
     if sessions.is_empty() {
         sync_log(dir, "No sessions to sync");
         let _ = fs::remove_file(&lock);
@@ -173,6 +175,8 @@ pub fn cmd_sync_transcripts(dir: &Path) -> i32 {
             ));
         }
     }
+
+    let sessions = crate::projects::filter_sessions_by_enabled(dir, sessions);
 
     if sessions.is_empty() {
         let _ = fs::remove_file(&lock);

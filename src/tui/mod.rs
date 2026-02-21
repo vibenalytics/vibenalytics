@@ -6,6 +6,7 @@ mod sessions;
 mod projects;
 mod settings;
 mod import_picker;
+mod onboarding;
 
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
@@ -71,6 +72,7 @@ struct App {
     status_msg: String,
     login_state: Option<crate::auth::LoginListener>,
     import_picker: Option<import_picker::ImportPickerState>,
+    onboarding: Option<onboarding::OnboardingState>,
 }
 
 impl App {
@@ -83,6 +85,25 @@ impl App {
 
         let mut projects_state = projects::ProjectsState::default();
         projects_state.load(dir);
+
+        // Check if onboarding is needed
+        let onboarding = if connected {
+            let registry = crate::projects::read_projects(dir);
+            if !registry.onboarding_completed {
+                let ob = onboarding::OnboardingState::new();
+                if ob.is_none() {
+                    // No projects discovered, mark onboarding done
+                    let mut reg = registry;
+                    reg.onboarding_completed = true;
+                    let _ = crate::projects::write_projects(dir, &reg);
+                }
+                ob
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         App {
             dir: dir.to_path_buf(),
@@ -97,6 +118,7 @@ impl App {
             status_msg: String::new(),
             login_state: None,
             import_picker: None,
+            onboarding,
         }
     }
 
@@ -110,6 +132,54 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyCode) {
+        // Onboarding wizard takes highest priority
+        if let Some(ref mut ob) = self.onboarding {
+            match &ob.step {
+                onboarding::Step::SyncMode => match key {
+                    KeyCode::Up => ob.mode_up(),
+                    KeyCode::Down => ob.mode_down(),
+                    KeyCode::Enter => ob.confirm_mode(),
+                    KeyCode::Esc => { self.onboarding = None; }
+                    _ => {}
+                },
+                onboarding::Step::ProjectSelection => match key {
+                    KeyCode::Up => ob.up(),
+                    KeyCode::Down => ob.down(),
+                    KeyCode::Char(' ') => ob.toggle(),
+                    KeyCode::Char('a') => ob.select_all(),
+                    KeyCode::Char('n') => ob.deselect_all(),
+                    KeyCode::Enter => ob.confirm_projects(),
+                    KeyCode::Esc => {
+                        ob.step = onboarding::Step::SyncMode;
+                        ob.cursor = 0;
+                        ob.scroll = 0;
+                    }
+                    _ => {}
+                },
+                onboarding::Step::ImportPrompt => match key {
+                    KeyCode::Up => ob.import_up(),
+                    KeyCode::Down => ob.import_down(),
+                    KeyCode::Enter => {
+                        let do_import = ob.import_cursor == 0;
+                        let dir = self.dir.clone();
+                        ob.finish(&dir, do_import);
+                        self.reload();
+                    }
+                    KeyCode::Esc => {
+                        ob.step = onboarding::Step::ProjectSelection;
+                    }
+                    _ => {}
+                },
+                onboarding::Step::Importing => {}
+                onboarding::Step::Done(_) => {
+                    if key == KeyCode::Enter || key == KeyCode::Esc {
+                        self.onboarding = None;
+                    }
+                }
+            }
+            return;
+        }
+
         // Import picker takes priority
         if let Some(ref mut picker) = self.import_picker {
             match &picker.phase {
@@ -153,7 +223,12 @@ impl App {
 
         match key {
             KeyCode::Esc => {
-                self.should_quit = true;
+                if self.tab == Tab::Projects && self.projects_state.has_changes() {
+                    self.projects_state.discard();
+                    self.status_msg = "Changes discarded".into();
+                } else {
+                    self.should_quit = true;
+                }
             }
             KeyCode::Left => {
                 self.tab = self.tab.prev();
@@ -177,10 +252,19 @@ impl App {
                     _ => {}
                 }
             }
+            KeyCode::Char(' ') => {
+                if self.tab == Tab::Projects {
+                    self.projects_state.toggle();
+                }
+            }
             KeyCode::Enter => {
                 match self.tab {
                     Tab::Settings => self.handle_settings_action(),
-                    Tab::Projects => self.handle_project_toggle(),
+                    Tab::Projects => {
+                        if self.projects_state.has_changes() {
+                            self.status_msg = self.projects_state.save(&self.dir);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -193,8 +277,10 @@ impl App {
             0 => {
                 match crate::auth::start_login() {
                     Ok(listener) => {
+                        let port = listener.listener.local_addr().map(|a| a.port()).unwrap_or(0);
+                        let url = format!("{}/auth/cli?port={port}&state={}", crate::config::DEFAULT_FRONTEND_BASE, listener.nonce);
+                        self.status_msg = format!("Opening browser... If it didn't open, visit: {url}");
                         self.login_state = Some(listener);
-                        self.status_msg = "Waiting for browser authorization... (Esc to cancel)".into();
                     }
                     Err(e) => {
                         self.status_msg = format!("Login failed: {e}");
@@ -220,29 +306,22 @@ impl App {
                     }
                 }
             }
+            3 => {
+                let mut registry = crate::projects::read_projects(&self.dir);
+                registry.default_enabled = !registry.default_enabled;
+                match crate::projects::write_projects(&self.dir, &registry) {
+                    Ok(()) => {
+                        let mode = if registry.default_enabled { "auto" } else { "manual" };
+                        self.status_msg = format!("Sync mode changed to {mode}");
+                        self.reload();
+                    }
+                    Err(e) => {
+                        self.status_msg = format!("Failed to save: {e}");
+                    }
+                }
+            }
             _ => {}
         }
-    }
-
-    fn handle_project_toggle(&mut self) {
-        let idx = self.projects_state.selected;
-        if idx >= self.projects_state.registry.projects.len() {
-            return;
-        }
-        let p = &self.projects_state.registry.projects[idx];
-        let name = p.name.clone();
-        if p.enabled {
-            match crate::projects::disable_project(&self.dir, &name) {
-                Ok(n) => self.status_msg = format!("Paused \"{}\"", n),
-                Err(e) => self.status_msg = e,
-            }
-        } else {
-            match crate::projects::enable_project(&self.dir, &name) {
-                Ok(n) => self.status_msg = format!("Resumed \"{}\"", n),
-                Err(e) => self.status_msg = e,
-            }
-        }
-        self.projects_state.load(&self.dir);
     }
 
     fn poll_login(&mut self) {
@@ -259,6 +338,18 @@ impl App {
                     }
                     self.login_state = None;
                     self.reload();
+
+                    // Trigger onboarding if not completed
+                    let registry = crate::projects::read_projects(&self.dir);
+                    if !registry.onboarding_completed {
+                        if let Some(ob) = onboarding::OnboardingState::new() {
+                            self.onboarding = Some(ob);
+                        } else {
+                            let mut reg = registry;
+                            reg.onboarding_completed = true;
+                            let _ = crate::projects::write_projects(&self.dir, &reg);
+                        }
+                    }
                 }
                 Ok(None) => {}
                 Err(e) => {
@@ -304,6 +395,36 @@ pub fn run(dir: &Path) -> i32 {
 
         let _ = terminal.draw(|frame| {
             let size = frame.area();
+
+            // Onboarding wizard replaces the whole screen
+            if let Some(ref mut ob) = app.onboarding {
+                let layout = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(1),
+                        Constraint::Min(6),
+                        Constraint::Length(1),
+                    ])
+                    .split(size);
+
+                header::render_header(frame, layout[0], &app.user_name, app.connected);
+                onboarding::render(frame, layout[1], ob);
+
+                let hints = match &ob.step {
+                    onboarding::Step::SyncMode =>
+                        "↑/↓ select  enter continue  esc skip",
+                    onboarding::Step::ProjectSelection =>
+                        "↑/↓ navigate  space toggle  a all  n none  enter confirm  esc back",
+                    onboarding::Step::ImportPrompt =>
+                        "↑/↓ select  enter confirm  esc back",
+                    onboarding::Step::Importing =>
+                        "importing...",
+                    onboarding::Step::Done(_) =>
+                        "enter continue",
+                };
+                header::render_footer(frame, layout[2], hints);
+                return;
+            }
 
             // Import picker replaces the whole screen
             if let Some(ref mut picker) = app.import_picker {
@@ -357,8 +478,8 @@ pub fn run(dir: &Path) -> i32 {
             match app.tab {
                 Tab::Dashboard => dashboard::render(frame, layout[2]),
                 Tab::Sessions => sessions::render(frame, layout[2], &app.sessions_state),
-                Tab::Projects => projects::render(frame, layout[2], &app.projects_state),
-                Tab::Settings => settings::render(frame, layout[2], &app.settings_state, &app.user_name, app.connected, app.pending_events),
+                Tab::Projects => projects::render(frame, layout[2], &mut app.projects_state),
+                Tab::Settings => settings::render(frame, layout[2], &app.settings_state, &app.user_name, app.connected, app.pending_events, app.projects_state.registry.default_enabled),
             }
 
             if has_status {
@@ -374,7 +495,11 @@ pub fn run(dir: &Path) -> i32 {
                 match app.tab {
                     Tab::Dashboard => "←/→ tabs  esc quit",
                     Tab::Sessions => "↑/↓ select  ←/→ tabs  esc quit",
-                    Tab::Projects => "↑/↓ select  enter toggle  ←/→ tabs  esc quit",
+                    Tab::Projects => if app.projects_state.has_changes() {
+                        "↑/↓ navigate  space toggle  enter save  esc discard"
+                    } else {
+                        "↑/↓ navigate  space toggle  ←/→ tabs  esc quit"
+                    },
                     Tab::Settings => "↑/↓ select  enter run  ←/→ tabs  esc quit",
                 }
             };
