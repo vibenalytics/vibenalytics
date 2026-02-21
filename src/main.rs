@@ -1,859 +1,149 @@
-/// vibenalytics v2 — Vibenalytics metrics logger, aggregator and sync client
+/// vibenalytics v3 — Claude Code usage analytics CLI
 ///
 /// Single Rust binary. Zero runtime dependencies.
-///
-/// Usage:
-///   vibenalytics log [--use-transcripts]               Read hook JSON from stdin, strip content, append to metrics.jsonl
-///   vibenalytics sync [--use-transcripts]              Aggregate + POST + flush
-///   vibenalytics login                                Browser-based login (opens browser)
-///   vibenalytics status                               Show registration
-///   vibenalytics aggregate <file>                     Dump aggregated JSON to stdout
-///   vibenalytics tui                                  Launch interactive TUI dashboard
-///   vibenalytics import-from-history [project] [--dry]   Parse ~/.claude/ transcripts → sync (or --dry for JSONL only)
 
+mod aggregation;
+mod auth;
+mod config;
+mod hash;
+mod http;
+mod import;
+mod log_cmd;
+mod paths;
+mod projects;
+mod sync;
+mod transcripts;
 mod tui;
-use std::collections::{HashMap, HashSet};
+
+use clap::{Parser, Subcommand};
 use std::env;
-use std::fs;
-use std::io::{self, BufRead, Read, Seek, Write};
-use std::net::TcpListener;
-use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::io::IsTerminal;
 
-use chrono::Utc;
-use serde_json::{json, Map, Value};
+#[derive(Parser)]
+#[command(
+    name = "vibenalytics",
+    about = "Claude Code usage analytics",
+    version,
+    after_help = "EXAMPLES:\n    vibenalytics                    Launch the dashboard\n    vibenalytics init               First-time setup\n    vibenalytics project list       See tracked projects\n    vibenalytics import --dry       Preview history import\n\nDOCS:\n    https://docs.vibenalytics.dev"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
 
-const DEFAULT_API_BASE: &str = match option_env!("API_BASE") {
-    Some(url) => url,
-    None => "http://localhost:3001/api",
-};
+    /// Verbose output (repeat for more: -vv, -vvv)
+    #[arg(short, long, action = clap::ArgAction::Count, global = true)]
+    verbose: u8,
 
-const DEFAULT_FRONTEND_BASE: &str = match option_env!("FRONTEND_BASE") {
-    Some(url) => url,
-    None => "http://localhost:3000",
-};
+    /// Suppress non-error output
+    #[arg(short, long, global = true)]
+    quiet: bool,
 
-/// FNV-1a 64-bit hash — deterministic across all platforms and Rust versions.
-fn hash_path(path: &str) -> String {
-    const FNV_OFFSET: u64 = 14695981039346656037;
-    const FNV_PRIME: u64 = 1099511628211;
-    let mut hash = FNV_OFFSET;
-    for byte in path.as_bytes() {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    format!("{:016x}", hash)
+    /// Disable colored output
+    #[arg(long, global = true)]
+    no_color: bool,
+
+    /// Machine-readable JSON output
+    #[arg(long, global = true)]
+    json: bool,
 }
 
-// ---- Path helpers ----
+#[derive(Subcommand)]
+enum Commands {
+    /// Set up Vibenalytics (scan projects, configure sync)
+    Init,
 
-/// Returns the data directory for config, metrics, and logs.
-/// Precedence: $XDG_DATA_HOME/vibenalytics → ~/.config/vibenalytics → %APPDATA%\vibenalytics → binary dir
-fn data_dir() -> PathBuf {
-    let dir = if let Ok(xdg) = env::var("XDG_DATA_HOME") {
-        PathBuf::from(xdg).join("vibenalytics")
-    } else if let Ok(home) = env::var("HOME") {
-        PathBuf::from(home).join(".config").join("vibenalytics")
-    } else if let Ok(appdata) = env::var("APPDATA") {
-        PathBuf::from(appdata).join("vibenalytics")
-    } else {
-        // Last resort: next to the binary
-        let exe_raw = env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
-        let exe = fs::canonicalize(&exe_raw).unwrap_or(exe_raw);
-        exe.parent().unwrap_or(Path::new(".")).to_path_buf()
-    };
-    let _ = fs::create_dir_all(&dir);
-    dir
+    /// Authenticate via browser
+    Login,
+
+    /// Clear stored credentials
+    Logout,
+
+    /// Show connection status and sync health
+    Status,
+
+    /// Manage tracked projects
+    Project {
+        #[command(subcommand)]
+        action: ProjectAction,
+    },
+
+    /// Manually trigger a sync
+    Sync {
+        /// Use transcript-based sync
+        #[arg(long)]
+        use_transcripts: bool,
+
+        /// Force sync even if recently synced
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Import session history from ~/.claude/
+    Import {
+        /// Filter by project name (substring match)
+        project: Option<String>,
+
+        /// Parse only, skip backend sync
+        #[arg(long)]
+        dry: bool,
+    },
+
+    /// (internal) Hook handler — reads event JSON from stdin
+    #[command(hide = true)]
+    Log {
+        /// Use transcript-based logging
+        #[arg(long)]
+        use_transcripts: bool,
+    },
 }
 
-fn metrics_path(dir: &Path) -> PathBuf {
-    dir.join("metrics.jsonl")
+#[derive(Subcommand)]
+enum ProjectAction {
+    /// List tracked projects
+    List,
+
+    /// Add a project (defaults to current directory)
+    Add {
+        /// Path to project directory
+        path: Option<String>,
+    },
+
+    /// Remove a project from tracking
+    Remove {
+        /// Project name (or omit to use current directory)
+        name: Option<String>,
+    },
+
+    /// Re-enable a paused project
+    Enable {
+        /// Project name (or omit to use current directory)
+        name: Option<String>,
+    },
+
+    /// Pause syncing without removing
+    Disable {
+        /// Project name (or omit to use current directory)
+        name: Option<String>,
+    },
 }
 
-fn config_path(dir: &Path) -> PathBuf {
-    dir.join(".sync-config.json")
+fn resolve_name_or_cwd(name: Option<String>) -> String {
+    name.unwrap_or_else(|| {
+        env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| ".".to_string())
+    })
 }
 
-fn log_path(dir: &Path) -> PathBuf {
-    dir.join("sync.log")
-}
-
-// ---- Logging ----
-
-fn sync_log(dir: &Path, msg: &str) {
-    let path = log_path(dir);
-    let ts = Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
-    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) {
-        let _ = writeln!(f, "[{ts}] {msg}");
-    }
-}
-
-// ---- Config ----
-
-fn read_config(dir: &Path) -> Option<Value> {
-    let data = fs::read_to_string(config_path(dir)).ok()?;
-    serde_json::from_str(&data).ok()
-}
-
-fn write_config(dir: &Path, cfg: &Value) -> io::Result<()> {
-    let path = config_path(dir);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let data = serde_json::to_string_pretty(cfg)?;
-    fs::write(path, data)
-}
-
-fn config_get(dir: &Path, key: &str) -> Option<String> {
-    read_config(dir)?
-        .get(key)?
-        .as_str()
-        .map(|s| s.to_string())
-}
-
-// ---- Transcript cursor state ----
-
-fn cursors_path(dir: &Path) -> PathBuf {
-    dir.join("transcript-cursors.json")
-}
-
-fn read_cursors(dir: &Path) -> HashMap<String, Value> {
-    let data = match fs::read_to_string(cursors_path(dir)) {
-        Ok(d) => d,
-        Err(_) => return HashMap::new(),
-    };
-    let val: Value = match serde_json::from_str(&data) {
-        Ok(v) => v,
-        Err(_) => return HashMap::new(),
-    };
-    match val {
-        Value::Object(map) => map.into_iter().collect(),
-        _ => HashMap::new(),
-    }
-}
-
-fn write_cursors(dir: &Path, cursors: &HashMap<String, Value>) {
-    let map: serde_json::Map<String, Value> = cursors.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-    let val = Value::Object(map);
-    let tmp = cursors_path(dir).with_extension("json.tmp");
-    let target = cursors_path(dir);
-    if let Ok(data) = serde_json::to_string_pretty(&val) {
-        if fs::write(&tmp, &data).is_ok() {
-            let _ = fs::rename(&tmp, &target);
-        }
-    }
-}
-
-// ---- HTTP ----
-
-fn http_post(url: &str, body: &str, api_key: Option<&str>) -> Result<(u16, String), String> {
-    let mut req = ureq::post(url).set("Content-Type", "application/json");
-    if let Some(key) = api_key {
-        req = req.set("X-API-Key", key);
-    }
-    let resp = req.send_string(body).map_err(|e| format!("{e}"))?;
-    let status = resp.status();
-    let body = resp.into_string().unwrap_or_default();
-    Ok((status, body))
-}
-
-// ---- Log command ----
-
-fn strip_field_bytes(obj: &mut Map<String, Value>, key: &str) {
-    if let Some(val) = obj.remove(key) {
-        let bytes = match &val {
-            Value::String(s) => s.len(),
-            other => serde_json::to_string(other).map(|s| s.len()).unwrap_or(0),
-        };
-        let type_name = match &val {
-            Value::String(_) => "string",
-            _ => "other",
-        };
-        obj.insert(
-            key.to_string(),
-            json!({"_bytes": bytes, "_type": type_name}),
-        );
-    }
-}
-
-fn strip_command(obj: &mut Map<String, Value>) {
-    if let Some(Value::String(cmd)) = obj.remove("command") {
-        let bytes = cmd.len();
-        let first_token = cmd.split_whitespace().next().unwrap_or("");
-        let bin = first_token.rsplit('/').next().unwrap_or(first_token);
-        let preview: String = cmd.chars().take(80).collect();
-        obj.insert(
-            "command".to_string(),
-            json!({"_bytes": bytes, "_bin": bin, "_preview": preview}),
-        );
-    }
-}
-
-fn strip_long_string(obj: &mut Map<String, Value>, key: &str, max_len: usize, preview_len: usize) {
-    let should_strip = obj
-        .get(key)
-        .and_then(|v| v.as_str())
-        .is_some_and(|s| s.len() > max_len);
-    if !should_strip {
-        return;
-    }
-    if let Some(Value::String(s)) = obj.remove(key) {
-        let bytes = s.len();
-        let mut replacement = json!({"_bytes": bytes});
-        if preview_len > 0 {
-            let preview: String = s.chars().take(preview_len).collect();
-            replacement["_preview"] = Value::String(preview);
-        }
-        obj.insert(key.to_string(), replacement);
-    }
-}
-
-const SYNC_BUFFER_THRESHOLD: usize = 10;
-const SYNC_EVENTS: &[&str] = &["SessionStart", "SessionEnd", "Stop", "UserPromptSubmit"];
-
-fn cmd_log(dir: &Path) -> i32 {
-    let mut input = String::new();
-    if io::stdin().read_to_string(&mut input).is_err() || input.is_empty() {
-        return 0;
-    }
-
-    let mut evt: Value = match serde_json::from_str(&input) {
-        Ok(v) => v,
-        Err(_) => {
-            let ts = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-            let line = json!({"logged_at": ts, "parse_error": true});
-            let path = metrics_path(dir);
-            if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) {
-                let _ = writeln!(f, "{}", line);
-            }
-            return 0;
-        }
-    };
-
-    let obj = match evt.as_object_mut() {
-        Some(o) => o,
-        None => return 0,
-    };
-
-    let event_name = obj
-        .get("hook_event_name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-
-    obj.insert("_input_bytes".to_string(), json!(input.len()));
-
-    let ts = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-    obj.insert("logged_at".to_string(), json!(ts));
-
-    let hostname = gethostname::gethostname()
-        .to_string_lossy()
-        .split('.')
-        .next()
-        .unwrap_or("unknown")
-        .to_string();
-    obj.insert("hostname".to_string(), json!(hostname));
-
-    // Strip tool_input content fields
-    if let Some(Value::Object(ti)) = obj.get_mut("tool_input") {
-        strip_field_bytes(ti, "content");
-        strip_field_bytes(ti, "old_string");
-        strip_field_bytes(ti, "new_string");
-        strip_field_bytes(ti, "new_source");
-        strip_command(ti);
-        strip_long_string(ti, "prompt", 200, 0);
-        strip_long_string(ti, "description", 300, 100);
-    }
-
-    // Strip tool_response → tool_response_bytes
-    if let Some(resp) = obj.remove("tool_response") {
-        let bytes = serde_json::to_string(&resp).map(|s| s.len()).unwrap_or(0);
-        obj.insert("tool_response_bytes".to_string(), json!(bytes));
-    }
-
-    // Strip transcript_path (not needed, avoid storing paths)
-    obj.remove("transcript_path");
-
-    // Use cwd as project identity: hash for stable ID, last dir name for display
-    if let Some(Value::String(cwd)) = obj.remove("cwd") {
-        obj.insert("path_hash".to_string(), json!(hash_path(&cwd)));
-        let project_name = cwd.rsplit('/').find(|s| !s.is_empty()).unwrap_or("unknown");
-        obj.insert("project".to_string(), json!(project_name));
-    }
-
-    // Strip user prompt content
-    if event_name == "UserPromptSubmit" {
-        if let Some(Value::String(prompt)) = obj.remove("prompt") {
-            obj.insert("prompt_bytes".to_string(), json!(prompt.len()));
-        }
-    }
-
-    let path = metrics_path(dir);
-    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) {
-        let _ = writeln!(f, "{}", serde_json::to_string(&evt).unwrap_or_default());
-    }
-
-    // Auto-sync: flush on boundary events or when buffer threshold reached
-    let is_boundary = SYNC_EVENTS.contains(&event_name.as_str());
-    let line_count = fs::read_to_string(&path)
-        .map(|c| c.lines().filter(|l| !l.trim().is_empty()).count())
-        .unwrap_or(0);
-
-    if is_boundary || line_count >= SYNC_BUFFER_THRESHOLD {
-        cmd_sync(dir);
-    }
-
-    0
-}
-
-// ---- Aggregation ----
-
-struct ToolLatency {
-    tool: String,
-    total_ms: u64,
-    count: u32,
-    min_ms: u64,
-    max_ms: u64,
-}
-
-struct PermissionStat {
-    tool: String,
-    domain: String,
-    count: u32,
-}
-
-struct Session {
-    session_id: String,
-    project: String,
-    path_hash: String,
-    started_at: String,
-    ended_at: String,
-    permission_mode: String,
-    events: HashMap<String, u32>,
-    tools: HashMap<String, u32>,
-    prompt_count: u32,
-    message_count: u32,
-    total_input_bytes: u64,
-    total_response_bytes: u64,
-    tool_latencies: Vec<ToolLatency>,
-    permission_requests: Vec<PermissionStat>,
-    tool_response_sizes: HashMap<String, (u64, u32)>,
-    parallel_tool_batches: u32,
-    hostname: String,
-    // Token counts (from transcript parsing)
-    total_input_tokens: u64,
-    total_output_tokens: u64,
-    total_cache_read_tokens: u64,
-    total_cache_creation_tokens: u64,
-    total_turn_duration_ms: u64,
-    turn_count: u32,
-    model: String,
-}
-
-impl Session {
-    fn new(id: &str) -> Self {
-        Session {
-            session_id: id.to_string(),
-            project: "unknown".to_string(),
-            path_hash: String::new(),
-            started_at: String::new(),
-            ended_at: String::new(),
-            permission_mode: String::new(),
-            events: HashMap::new(),
-            tools: HashMap::new(),
-            prompt_count: 0,
-            message_count: 0,
-            total_input_bytes: 0,
-            total_response_bytes: 0,
-            tool_latencies: Vec::new(),
-            permission_requests: Vec::new(),
-            tool_response_sizes: HashMap::new(),
-            parallel_tool_batches: 0,
-            hostname: String::new(),
-            total_input_tokens: 0,
-            total_output_tokens: 0,
-            total_cache_read_tokens: 0,
-            total_cache_creation_tokens: 0,
-            total_turn_duration_ms: 0,
-            turn_count: 0,
-            model: String::new(),
-        }
-    }
-}
-
-fn aggregate_file(filepath: &Path) -> Vec<Session> {
-    let content = match fs::read_to_string(filepath) {
-        Ok(c) => c,
-        Err(_) => return vec![],
-    };
-
-    let mut sessions: Vec<Session> = Vec::new();
-    let mut session_map: HashMap<String, usize> = HashMap::new();
-    let mut pre_tool_times: HashMap<(String, String), (String, String)> = HashMap::new();
-    let mut pending_tools: HashMap<String, u32> = HashMap::new();
-
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-
-        let evt: Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
-        let sid = evt
-            .get("session_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-
-        let idx = if let Some(&i) = session_map.get(sid) {
-            i
-        } else {
-            let i = sessions.len();
-            sessions.push(Session::new(sid));
-            session_map.insert(sid.to_string(), i);
-            i
-        };
-        let s = &mut sessions[idx];
-
-        let ts_str = evt.get("logged_at").and_then(|v| v.as_str()).unwrap_or("");
-        if !ts_str.is_empty() {
-            if s.started_at.is_empty() || ts_str < s.started_at.as_str() {
-                s.started_at = ts_str.to_string();
-            }
-            if s.ended_at.is_empty() || ts_str > s.ended_at.as_str() {
-                s.ended_at = ts_str.to_string();
-            }
-        }
-
-        // Collect path_hash from event (set by cmd_log)
-        if let Some(ph) = evt.get("path_hash").and_then(|v| v.as_str()) {
-            if s.path_hash.is_empty() {
-                s.path_hash = ph.to_string();
-            }
-        }
-
-        if let Some(proj) = evt.get("project").and_then(|v| v.as_str()) {
-            if proj != "unknown" {
-                s.project = proj.to_string();
-            }
-        }
-
-        let event = evt
-            .get("hook_event_name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        if !event.is_empty() {
-            *s.events.entry(event.to_string()).or_insert(0) += 1;
-        }
-
-        let tool_name = evt
-            .get("tool_name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let tool_use_id = evt
-            .get("tool_use_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-
-        if event == "PreToolUse" && !tool_use_id.is_empty() && !ts_str.is_empty() {
-            pre_tool_times.insert(
-                (sid.to_string(), tool_use_id.to_string()),
-                (tool_name.to_string(), ts_str.to_string()),
-            );
-            let pending = pending_tools.entry(sid.to_string()).or_insert(0);
-            *pending += 1;
-            if *pending > 1 {
-                s.parallel_tool_batches += 1;
-            }
-        }
-
-        if (event == "PostToolUse" || event == "PostToolUseFailure") && !tool_name.is_empty() {
-            if event == "PostToolUse" {
-                *s.tools.entry(tool_name.to_string()).or_insert(0) += 1;
-            } else {
-                *s.tools
-                    .entry(format!("{tool_name}_FAILED"))
-                    .or_insert(0) += 1;
-            }
-
-            if !tool_use_id.is_empty() && !ts_str.is_empty() {
-                let key = (sid.to_string(), tool_use_id.to_string());
-                if let Some((pre_tool, pre_ts)) = pre_tool_times.remove(&key) {
-                    if let (Some(start_epoch), Some(end_epoch)) = (
-                        parse_iso_timestamp(&pre_ts),
-                        parse_iso_timestamp(ts_str),
-                    ) {
-                        let latency_ms = ((end_epoch - start_epoch) * 1000) as u64;
-                        if let Some(tl) = s.tool_latencies.iter_mut().find(|t| t.tool == pre_tool) {
-                            tl.total_ms += latency_ms;
-                            tl.count += 1;
-                            tl.min_ms = tl.min_ms.min(latency_ms);
-                            tl.max_ms = tl.max_ms.max(latency_ms);
-                        } else {
-                            s.tool_latencies.push(ToolLatency {
-                                tool: pre_tool,
-                                total_ms: latency_ms,
-                                count: 1,
-                                min_ms: latency_ms,
-                                max_ms: latency_ms,
-                            });
-                        }
-                    }
-                }
-                if let Some(pending) = pending_tools.get_mut(sid) {
-                    *pending = pending.saturating_sub(1);
-                }
-            }
-
-            if let Some(rb) = evt.get("tool_response_bytes").and_then(|v| v.as_u64()) {
-                let entry = s
-                    .tool_response_sizes
-                    .entry(tool_name.to_string())
-                    .or_insert((0, 0));
-                entry.0 += rb;
-                entry.1 += 1;
-            }
-        }
-
-        if event == "PermissionRequest" {
-            let perm_tool = tool_name.to_string();
-            let domain = evt
-                .get("permission_suggestions")
-                .and_then(|v| v.as_array())
-                .and_then(|arr| arr.first())
-                .and_then(|s| s.get("rules"))
-                .and_then(|v| v.as_array())
-                .and_then(|arr| arr.first())
-                .and_then(|r| r.get("ruleContent"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-
-            if let Some(ps) = s
-                .permission_requests
-                .iter_mut()
-                .find(|p| p.tool == perm_tool && p.domain == domain)
-            {
-                ps.count += 1;
-            } else {
-                s.permission_requests.push(PermissionStat {
-                    tool: perm_tool,
-                    domain,
-                    count: 1,
-                });
-            }
-        }
-
-        if event == "UserPromptSubmit" {
-            s.prompt_count += 1;
-        }
-
-        if let Some(ib) = evt.get("_input_bytes").and_then(|v| v.as_u64()) {
-            s.total_input_bytes += ib;
-        }
-        if let Some(rb) = evt.get("tool_response_bytes").and_then(|v| v.as_u64()) {
-            s.total_response_bytes += rb;
-        }
-
-        if let Some(pm) = evt.get("permission_mode").and_then(|v| v.as_str()) {
-            s.permission_mode = pm.to_string();
-        }
-    }
-
-    sessions
-}
-
-fn parse_iso_timestamp(ts: &str) -> Option<i64> {
-    chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%SZ")
-        .ok()
-        .map(|dt| dt.and_utc().timestamp())
-}
-
-fn build_payload(sessions: &[Session]) -> Value {
-    let arr: Vec<Value> = sessions
-        .iter()
-        .map(|s| {
-            let mut obj = json!({
-                "session_id": s.session_id,
-                "project_hash": s.path_hash,
-                "project_name": s.project,
-                "started_at": s.started_at,
-                "ended_at": s.ended_at,
-                "events": s.events,
-                "tools": s.tools,
-                "prompt_count": s.prompt_count,
-                "total_input_bytes": s.total_input_bytes,
-                "total_response_bytes": s.total_response_bytes,
-            });
-            if !s.permission_mode.is_empty() {
-                obj["permission_mode"] = json!(s.permission_mode);
-            }
-            if let (Some(start), Some(end)) = (
-                parse_iso_timestamp(&s.started_at),
-                parse_iso_timestamp(&s.ended_at),
-            ) {
-                obj["duration_seconds"] = json!(end - start);
-            }
-            if !s.tool_latencies.is_empty() {
-                let latencies: Vec<Value> = s.tool_latencies.iter().map(|tl| {
-                    json!({
-                        "tool": tl.tool,
-                        "avg_ms": if tl.count > 0 { tl.total_ms / tl.count as u64 } else { 0 },
-                        "min_ms": tl.min_ms,
-                        "max_ms": tl.max_ms,
-                        "count": tl.count,
-                    })
-                }).collect();
-                obj["tool_latencies"] = json!(latencies);
-            }
-            if !s.permission_requests.is_empty() {
-                let perms: Vec<Value> = s.permission_requests.iter().map(|p| {
-                    json!({ "tool": p.tool, "domain": p.domain, "count": p.count })
-                }).collect();
-                obj["permission_requests"] = json!(perms);
-            }
-            if !s.tool_response_sizes.is_empty() {
-                let sizes: Vec<Value> = s.tool_response_sizes.iter().map(|(tool, (total, count))| {
-                    json!({
-                        "tool": tool,
-                        "total_bytes": total,
-                        "avg_bytes": if *count > 0 { total / *count as u64 } else { 0 },
-                        "count": count,
-                    })
-                }).collect();
-                obj["tool_response_sizes"] = json!(sizes);
-            }
-            if s.parallel_tool_batches > 0 {
-                obj["parallel_tool_batches"] = json!(s.parallel_tool_batches);
-            }
-            // Token data (from transcript parsing)
-            if s.total_input_tokens > 0 || s.total_output_tokens > 0 {
-                obj["total_input_tokens"] = json!(s.total_input_tokens);
-                obj["total_output_tokens"] = json!(s.total_output_tokens);
-                obj["total_cache_read_tokens"] = json!(s.total_cache_read_tokens);
-                obj["total_cache_creation_tokens"] = json!(s.total_cache_creation_tokens);
-            }
-            if s.total_turn_duration_ms > 0 {
-                obj["total_turn_duration_ms"] = json!(s.total_turn_duration_ms);
-                obj["turn_count"] = json!(s.turn_count);
-            }
-            if !s.model.is_empty() {
-                obj["model"] = json!(s.model);
-            }
-            obj
-        })
-        .collect();
-    json!({ "sessions": arr })
-}
-
-// ---- Commands ----
-
-fn cmd_aggregate(filepath: &str) -> i32 {
-    let sessions = aggregate_file(Path::new(filepath));
-    if sessions.is_empty() {
-        eprintln!("No events found in {filepath}");
-        return 1;
-    }
-    let payload = build_payload(&sessions);
-    println!("{}", serde_json::to_string(&payload).unwrap_or_default());
-    0
-}
-
-fn frontend_url(dir: &Path) -> String {
-    config_get(dir, "frontendBase")
-        .unwrap_or_else(|| DEFAULT_FRONTEND_BASE.to_string())
-}
-
-/// Generate a random hex nonce for CSRF protection in browser login.
-fn generate_nonce() -> String {
-    // Try /dev/urandom (Unix)
-    if let Ok(mut f) = fs::File::open("/dev/urandom") {
-        let mut buf = [0u8; 16];
-        if io::Read::read_exact(&mut f, &mut buf).is_ok() {
-            return buf.iter().map(|b| format!("{:02x}", b)).collect();
-        }
-    }
-    // Fallback: timestamp nanos + pid (less random but unpredictable enough for localhost)
-    let ts = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let pid = std::process::id();
-    format!("{:016x}{:08x}", ts, pid)
-}
-
-fn cmd_login_browser(dir: &Path) -> i32 {
-    let api = config_get(dir, "apiBase")
-        .unwrap_or_else(|| DEFAULT_API_BASE.to_string());
-
-    // Step 1: Bind a one-shot TCP listener on a random localhost port
-    let listener = match TcpListener::bind("127.0.0.1:0") {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("Failed to bind localhost port: {e}");
-            return 1;
-        }
-    };
-    let port = listener.local_addr().unwrap().port();
-    let nonce = generate_nonce();
-
-    // Step 2: Open browser with state nonce for CSRF protection
-    let frontend = frontend_url(dir);
-    let auth_url = format!("{frontend}/auth/cli?port={port}&state={nonce}");
-
-    eprintln!("Opening browser for authentication...\n");
-    if let Err(e) = open::that(&auth_url) {
-        eprintln!("Could not open browser: {e}");
-    }
-    eprintln!("If the browser didn't open, visit this URL:");
-    eprintln!("  {auth_url}\n");
-    eprintln!("Waiting for authorization (press Ctrl+C to cancel)...");
-
-    // Step 3: Set timeout and wait for the callback
-    listener.set_nonblocking(true).ok();
-    let timeout = std::time::Duration::from_secs(300); // 5 minutes
-    let start = std::time::Instant::now();
-    let poll_interval = std::time::Duration::from_millis(200);
-
-    let stream = loop {
-        if start.elapsed() > timeout {
-            eprintln!("\nTimed out waiting for authorization.");
-            return 1;
-        }
-        match listener.accept() {
-            Ok((stream, _)) => break stream,
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(poll_interval);
-                continue;
-            }
-            Err(e) => {
-                eprintln!("\nConnection error: {e}");
-                return 1;
-            }
-        }
-    };
-
-    // Step 4: Read the HTTP request
-    stream.set_nonblocking(false).ok();
-    let mut reader = io::BufReader::new(&stream);
-    let mut request_line = String::new();
-    if reader.read_line(&mut request_line).is_err() {
-        eprintln!("Failed to read request");
-        return 1;
-    }
-
-    // Parse: GET /callback?key=...&name=...&state=... HTTP/1.1
-    let api_key;
-    let user_name;
-    if let Some(path) = request_line.split_whitespace().nth(1) {
-        let query = path.splitn(2, '?').nth(1).unwrap_or("");
-        let params: HashMap<String, String> = query
-            .split('&')
-            .filter_map(|p| {
-                let mut kv = p.splitn(2, '=');
-                Some((kv.next()?.to_string(), urldecode(kv.next().unwrap_or(""))))
-            })
-            .collect();
-
-        // Verify CSRF nonce
-        let callback_state = params.get("state").cloned().unwrap_or_default();
-        if callback_state != nonce {
-            let err_html = r#"<!DOCTYPE html><html><body><p>Authorization failed: invalid state.</p></body></html>"#;
-            let err_resp = format!("HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", err_html.len(), err_html);
-            let _ = (&stream).write_all(err_resp.as_bytes());
-            let _ = (&stream).flush();
-            drop(stream);
-            eprintln!("\nAuthorization rejected: state mismatch (possible CSRF attempt).");
-            return 1;
-        }
-
-        api_key = params.get("key").cloned().unwrap_or_default();
-        user_name = params.get("name").cloned().unwrap_or_else(|| "user".to_string());
-    } else {
-        eprintln!("Invalid request");
-        return 1;
-    }
-
-    // Step 5: Send success HTML response
-    let html = r#"<!DOCTYPE html><html><head><meta charset="utf-8"><title>Vibenalytics</title>
-<style>body{font-family:system-ui;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;background:#1a1a2e;color:#e0e0e0}
-.card{text-align:center;padding:2rem;border-radius:12px;background:#252540;border:1px solid #333}.ok{color:#c97856;font-size:1.5rem;margin-bottom:0.5rem}</style>
-</head><body><div class="card"><div class="ok">CLI Authorized!</div><p>You can close this tab and return to your terminal.</p></div></body></html>"#;
-
-    let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        html.len(),
-        html
-    );
-
-    let _ = (&stream).write_all(response.as_bytes());
-    let _ = (&stream).flush();
-    drop(stream);
-
-    if api_key.is_empty() {
-        eprintln!("\nNo API key received.");
-        return 1;
-    }
-
-    // Step 6: Save config
-    let cfg = json!({
-        "apiBase": api,
-        "apiKey": api_key,
-        "displayName": user_name,
-    });
-
-    if let Err(e) = write_config(dir, &cfg) {
-        eprintln!("Failed to write config: {e}");
-        return 1;
-    }
-
-    eprintln!("\nAuthorized! Logged in successfully.");
-    eprintln!("  Name:     {user_name}");
-    eprintln!(
-        "  API Key:  {}...{}",
-        &api_key[..8.min(api_key.len())],
-        &api_key[api_key.len().saturating_sub(4)..]
-    );
-    eprintln!("\nSync will now use this identity automatically.");
-
-    sync_log(dir, &format!("Browser login: {user_name}"));
-    0
-}
-
-fn urldecode(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let mut chars = s.bytes();
-    while let Some(b) = chars.next() {
-        match b {
-            b'%' => {
-                let hi = chars.next().unwrap_or(b'0');
-                let lo = chars.next().unwrap_or(b'0');
-                let hex = [hi, lo];
-                if let Ok(s) = std::str::from_utf8(&hex) {
-                    if let Ok(val) = u8::from_str_radix(s, 16) {
-                        result.push(val as char);
-                        continue;
-                    }
-                }
-                result.push('%');
-                result.push(hi as char);
-                result.push(lo as char);
-            }
-            b'+' => result.push(' '),
-            _ => result.push(b as char),
-        }
-    }
-    result
-}
-
-fn cmd_status(dir: &Path) -> i32 {
-    let cfg = match read_config(dir) {
+fn cmd_status(dir: &std::path::Path, json_output: bool) -> i32 {
+    let cfg = match config::read_config(dir) {
         Some(c) => c,
         None => {
-            println!("Not configured. Run: vibenalytics login");
+            if json_output {
+                println!(r#"{{"status":"not_configured"}}"#);
+            } else {
+                println!("Not configured. Run: vibenalytics init");
+            }
             return 1;
         }
     };
@@ -866,923 +156,167 @@ fn cmd_status(dir: &Path) -> i32 {
     };
 
     let key = get("apiKey");
-    let key_display = if key.len() > 12 {
-        format!("{}...{}", &key[..8], &key[key.len()-4..])
-    } else {
-        key
-    };
-
-    println!("Configured:");
-    println!("  Name:     {}", get("displayName"));
-    println!("  API Key:  {}", key_display);
-    println!("  API:      {}", get("apiBase"));
-    println!("  Default:  {DEFAULT_API_BASE}");
-    0
-}
-
-fn cmd_sync(dir: &Path) -> i32 {
-    let api_key = match config_get(dir, "apiKey") {
-        Some(key) => key,
-        None => {
-            sync_log(dir, "No API key configured — skipping sync");
-            return 0;
-        }
-    };
-
-    let api_base = config_get(dir, "apiBase")
-        .unwrap_or_else(|| DEFAULT_API_BASE.to_string());
-
-    let mp = metrics_path(dir);
-    match fs::metadata(&mp) {
-        Ok(m) if m.len() > 0 => {}
-        _ => {
-            sync_log(dir, "No metrics to sync");
-            return 0;
-        }
-    };
-
-    // Lock file
-    let lock = mp.with_extension("jsonl.lock");
-    if lock.exists() {
-        if let Ok(lm) = fs::metadata(&lock) {
-            if let Ok(age) = lm
-                .modified()
-                .unwrap_or(SystemTime::UNIX_EPOCH)
-                .elapsed()
-            {
-                if age.as_secs() < 60 {
-                    sync_log(dir, "Lock file exists, skipping sync");
-                    return 0;
-                }
-            }
-        }
-        let _ = fs::remove_file(&lock);
-        sync_log(dir, "Removed stale lock");
-    }
-
-    let _ = fs::write(&lock, format!("{}", std::process::id()));
-
-    let sessions = aggregate_file(&mp);
-    if sessions.is_empty() {
-        sync_log(dir, "No sessions to sync");
-        let _ = fs::remove_file(&lock);
-        return 0;
-    }
-
-    let payload = build_payload(&sessions);
-    let payload_str = serde_json::to_string(&payload).unwrap_or_default();
-    let n = sessions.len();
-
-    sync_log(dir, &format!("Syncing {n} sessions to {api_base}/sync"));
-
-    // POST to /api/sync with API key header
-    let url = format!("{api_base}/sync");
-    let result = http_post(&url, &payload_str, Some(&api_key));
-
-    let rc = match result {
-        Ok((200, resp)) => {
-            sync_log(dir, &format!("Sync OK: {resp}"));
-
-            let ts = Utc::now().format("%Y%m%d_%H%M%S");
-            let archive = dir.join(format!("metrics.synced.{ts}.jsonl"));
-            let _ = fs::rename(&mp, &archive);
-            let _ = fs::write(&mp, "");
-
-            sync_log(
-                dir,
-                &format!(
-                    "Flushed metrics.jsonl, archived to {}",
-                    archive.file_name().unwrap_or_default().to_string_lossy()
-                ),
-            );
-            0
-        }
-        Ok((code, resp)) => {
-            sync_log(dir, &format!("Sync FAILED (HTTP {code}): {resp}"));
-            1
-        }
-        Err(e) => {
-            sync_log(dir, &format!("Sync FAILED: {e}"));
-            1
-        }
-    };
-
-    let _ = fs::remove_file(&lock);
-    rc
-}
-
-// ---- Transcript-based log/sync ----
-
-fn claude_dir() -> PathBuf {
-    if let Ok(home) = env::var("HOME") {
-        PathBuf::from(home).join(".claude")
-    } else {
-        PathBuf::from(".claude")
-    }
-}
-
-/// Derive the transcript file path from cwd and session_id.
-/// Claude Code stores transcripts at ~/.claude/projects/{cwd_mangled}/{session_id}.jsonl
-/// where cwd_mangled replaces '/' with '-'.
-fn derive_transcript_path(cwd: &str, session_id: &str) -> PathBuf {
-    let mangled = cwd.replace('/', "-");
-    claude_dir()
-        .join("projects")
-        .join(&mangled)
-        .join(format!("{session_id}.jsonl"))
-}
-
-fn cmd_log_transcripts(dir: &Path) -> i32 {
-    let mut input = String::new();
-    if io::stdin().read_to_string(&mut input).is_err() || input.is_empty() {
-        return 0;
-    }
-
-    let evt: Value = match serde_json::from_str(&input) {
-        Ok(v) => v,
-        Err(_) => return 0,
-    };
-
-    let session_id = evt.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
-    let cwd = evt.get("cwd").and_then(|v| v.as_str()).unwrap_or("");
-    let event_name = evt
-        .get("hook_event_name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-
-    if session_id.is_empty() || cwd.is_empty() {
-        return 0;
-    }
-
-    // Derive transcript path (prefer transcript_path from hook, fallback to derivation)
-    let transcript_path = evt
-        .get("transcript_path")
-        .and_then(|v| v.as_str())
-        .map(|s| PathBuf::from(s))
-        .unwrap_or_else(|| derive_transcript_path(cwd, session_id));
-
-    let transcript_key = transcript_path.to_string_lossy().to_string();
-
-    // Compute project identity
-    let path_hash_val = hash_path(cwd);
-    let project_name = cwd
-        .rsplit('/')
-        .find(|s| !s.is_empty())
-        .unwrap_or("unknown");
-
-    // Upsert cursor entry for this session
-    let mut cursors = read_cursors(dir);
-    if !cursors.contains_key(&transcript_key) {
-        cursors.insert(
-            transcript_key,
-            json!({
-                "byte_offset": 0,
-                "session_id": session_id,
-                "project": project_name,
-                "path_hash": path_hash_val,
-                "last_request_id": "",
-                "last_output_tokens": 0
-            }),
-        );
-        write_cursors(dir, &cursors);
-    }
-
-    // Auto-sync on boundary events
-    if SYNC_EVENTS.contains(&event_name) {
-        cmd_sync_transcripts(dir);
-    }
-
-    0
-}
-
-fn cmd_sync_transcripts(dir: &Path) -> i32 {
-    let api_key = match config_get(dir, "apiKey") {
-        Some(key) => key,
-        None => {
-            sync_log(dir, "[transcripts] No API key configured — skipping sync");
-            return 0;
-        }
-    };
-
-    let api_base =
-        config_get(dir, "apiBase").unwrap_or_else(|| DEFAULT_API_BASE.to_string());
-
-    let mut cursors = read_cursors(dir);
-    if cursors.is_empty() {
-        return 0;
-    }
-
-    // Lock file
-    let lock = cursors_path(dir).with_extension("json.lock");
-    if lock.exists() {
-        if let Ok(lm) = fs::metadata(&lock) {
-            if let Ok(age) = lm
-                .modified()
-                .unwrap_or(SystemTime::UNIX_EPOCH)
-                .elapsed()
-            {
-                if age.as_secs() < 60 {
-                    return 0;
-                }
-            }
-        }
-        let _ = fs::remove_file(&lock);
-    }
-    let _ = fs::write(&lock, format!("{}", std::process::id()));
-
-    let mut sessions: Vec<Session> = Vec::new();
-    let mut updated_cursors: Vec<(String, Value)> = Vec::new();
-
-    for (transcript_key, cursor_val) in &cursors {
-        let transcript_path = Path::new(transcript_key.as_str());
-        if !transcript_path.exists() {
-            continue;
-        }
-
-        let byte_offset = cursor_val
-            .get("byte_offset")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        let prev_request_id = cursor_val
-            .get("last_request_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let prev_output_tokens = cursor_val
-            .get("last_output_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        let fallback_project = cursor_val
-            .get("project")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-        let fallback_path_hash = cursor_val
-            .get("path_hash")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-
-        // Check if transcript has grown
-        let file_size = fs::metadata(transcript_path)
-            .map(|m| m.len())
-            .unwrap_or(0);
-        if file_size <= byte_offset {
-            continue;
-        }
-
-        if let Some((session, new_offset, last_rid, last_out)) = parse_transcript_from_offset(
-            transcript_path,
-            byte_offset,
-            prev_request_id,
-            prev_output_tokens,
-            fallback_project,
-            fallback_path_hash,
-        ) {
-            sessions.push(session);
-            updated_cursors.push((
-                transcript_key.clone(),
-                json!({
-                    "byte_offset": new_offset,
-                    "session_id": cursor_val.get("session_id").and_then(|v| v.as_str()).unwrap_or(""),
-                    "project": cursor_val.get("project").and_then(|v| v.as_str()).unwrap_or("unknown"),
-                    "path_hash": cursor_val.get("path_hash").and_then(|v| v.as_str()).unwrap_or(""),
-                    "last_request_id": last_rid,
-                    "last_output_tokens": last_out
-                }),
-            ));
-        }
-    }
-
-    if sessions.is_empty() {
-        let _ = fs::remove_file(&lock);
-        return 0;
-    }
-
-    let payload = build_payload(&sessions);
-    let payload_str = serde_json::to_string(&payload).unwrap_or_default();
-    let n = sessions.len();
-
-    sync_log(
-        dir,
-        &format!("[transcripts] Syncing {n} sessions to {api_base}/sync"),
-    );
-
-    let url = format!("{api_base}/sync");
-    let result = http_post(&url, &payload_str, Some(&api_key));
-
-    let rc = match result {
-        Ok((200, resp)) => {
-            sync_log(dir, &format!("[transcripts] Sync OK: {resp}"));
-            // Update cursors on success
-            for (key, val) in updated_cursors {
-                cursors.insert(key, val);
-            }
-            write_cursors(dir, &cursors);
-            0
-        }
-        Ok((code, resp)) => {
-            sync_log(
-                dir,
-                &format!("[transcripts] Sync FAILED (HTTP {code}): {resp}"),
-            );
-            1
-        }
-        Err(e) => {
-            sync_log(dir, &format!("[transcripts] Sync FAILED: {e}"));
-            1
-        }
-    };
-
-    let _ = fs::remove_file(&lock);
-    rc
-}
-
-// ---- Import from history ----
-
-/// Parse ISO 8601 timestamp with optional milliseconds: "2026-01-31T18:15:00.104Z" or "2026-01-31T18:15:00Z"
-fn parse_iso_flex(ts: &str) -> Option<i64> {
-    // Try with milliseconds first
-    chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%S%.fZ")
-        .or_else(|_| chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%SZ"))
-        .ok()
-        .map(|dt| dt.and_utc().timestamp())
-}
-
-/// Discover all top-level session JSONL files in ~/.claude/projects/
-/// Returns (project_name, path_hash, jsonl_path) tuples
-fn discover_sessions(claude: &Path) -> Vec<(String, String, PathBuf)> {
-    let projects_dir = claude.join("projects");
-    let mut results: Vec<(String, String, PathBuf)> = Vec::new();
-
-    let entries = match fs::read_dir(&projects_dir) {
-        Ok(e) => e,
-        Err(_) => return results,
-    };
-
-    for entry in entries.flatten() {
-        let project_dir = entry.path();
-        if !project_dir.is_dir() {
-            continue;
-        }
-
-        // Decode project name from dir name: "-Users-foo-Documents-myproject" → "myproject"
-        let dir_name = project_dir
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        let project_name = dir_name.rsplit('-').next().unwrap_or("unknown").to_string();
-        // Reconstruct original path from dir name for hashing: "-Users-foo-bar" → "/Users/foo/bar"
-        let original_path = dir_name.replacen('-', "/", 1).replace('-', "/");
-        let path_hash_val = hash_path(&original_path);
-
-        // Find *.jsonl files directly in project dir (not in subdirectories)
-        if let Ok(files) = fs::read_dir(&project_dir) {
-            for file in files.flatten() {
-                let path = file.path();
-                if path.is_file()
-                    && path.extension().map(|e| e == "jsonl").unwrap_or(false)
-                {
-                    results.push((project_name.clone(), path_hash_val.clone(), path));
-                }
-            }
-        }
-    }
-
-    results
-}
-
-/// Parse a single session transcript JSONL file into a Session.
-fn parse_session_transcript(filepath: &Path, fallback_project: &str, fallback_path_hash: &str) -> Option<Session> {
-    let file = fs::File::open(filepath).ok()?;
-    let reader = io::BufReader::new(file);
-
-    let mut session = Session::new("unknown");
-    session.project = fallback_project.to_string();
-    session.path_hash = fallback_path_hash.to_string();
-
-    for line_result in reader.lines() {
-        let line = match line_result {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
-        let line = line.trim().to_string();
-        if line.is_empty() {
-            continue;
-        }
-
-        let evt: Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
-        // Track session ID
-        if session.session_id == "unknown" {
-            if let Some(sid) = evt.get("sessionId").and_then(|v| v.as_str()) {
-                session.session_id = sid.to_string();
-            }
-        }
-
-        // Track timestamps
-        if let Some(ts) = evt.get("timestamp").and_then(|v| v.as_str()) {
-            if session.started_at.is_empty() || ts < session.started_at.as_str() {
-                session.started_at = ts.to_string();
-            }
-            if session.ended_at.is_empty() || ts > session.ended_at.as_str() {
-                session.ended_at = ts.to_string();
-            }
-        }
-
-        let msg_type = evt.get("type").and_then(|v| v.as_str()).unwrap_or("");
-
-        match msg_type {
-            "assistant" => {
-                session.message_count += 1;
-
-                // Tool counting from content blocks
-                if let Some(content) = evt.pointer("/message/content").and_then(|v| v.as_array()) {
-                    for block in content {
-                        if block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
-                            let tool = block.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
-                            *session.tools.entry(tool.to_string()).or_insert(0) += 1;
-                        }
-                    }
-                }
-            }
-
-            "user" => {
-                session.message_count += 1;
-
-                // Real prompt = content is string; tool result = content is array
-                let is_prompt = evt
-                    .pointer("/message/content")
-                    .map(|v| v.is_string())
-                    .unwrap_or(false);
-                if is_prompt {
-                    session.prompt_count += 1;
-                }
-
-                // Extract metadata
-                if let Some(pm) = evt.get("permissionMode").and_then(|v| v.as_str()) {
-                    session.permission_mode = pm.to_string();
-                }
-                if session.project == fallback_project || session.project == "unknown" {
-                    if let Some(cwd) = evt.get("cwd").and_then(|v| v.as_str()) {
-                        if let Some(last) = cwd.rsplit('/').next() {
-                            if !last.is_empty() {
-                                session.project = last.to_string();
-                            }
-                        }
-                        if session.path_hash.is_empty() {
-                            session.path_hash = hash_path(cwd);
-                        }
-                    }
-                }
-            }
-
-            _ => {} // progress, system, file-history-snapshot, summary — skip
-        }
-    }
-
-    // Skip empty/broken sessions
-    if session.session_id == "unknown" && session.message_count == 0 {
-        return None;
-    }
-
-    // Set hostname
-    session.hostname = gethostname::gethostname()
-        .to_string_lossy()
-        .split('.')
-        .next()
-        .unwrap_or("unknown")
-        .to_string();
-
-    Some(session)
-}
-
-/// Accumulator for deduplicating token usage across streaming chunks sharing a requestId.
-struct UsageAccum {
-    input_tokens: u64,
-    output_tokens: u64,
-    cache_read_tokens: u64,
-    cache_creation_tokens: u64,
-}
-
-/// Parse a transcript file from a byte offset, returning a Session delta and new cursor state.
-/// Returns (session_delta, new_byte_offset, last_request_id, last_output_tokens).
-fn parse_transcript_from_offset(
-    filepath: &Path,
-    byte_offset: u64,
-    prev_request_id: &str,
-    prev_output_tokens: u64,
-    fallback_project: &str,
-    fallback_path_hash: &str,
-) -> Option<(Session, u64, String, u64)> {
-    let file_size = fs::metadata(filepath).ok()?.len();
-
-    // If file shrank (rewrite/compaction), reset to start
-    let start_offset = if file_size < byte_offset { 0 } else { byte_offset };
-
-    let mut file = fs::File::open(filepath).ok()?;
-    file.seek(io::SeekFrom::Start(start_offset)).ok()?;
-    let reader = io::BufReader::new(file);
-
-    let mut session = Session::new("unknown");
-    session.project = fallback_project.to_string();
-    session.path_hash = fallback_path_hash.to_string();
-
-    // Track usage per requestId for deduplication
-    let mut usage_map: HashMap<String, UsageAccum> = HashMap::new();
-    let mut last_request_id = String::new();
-    let mut current_offset = start_offset;
-    let mut lines_parsed = 0u32;
-
-    for line_result in reader.lines() {
-        let line = match line_result {
-            Ok(l) => l,
-            Err(_) => break, // incomplete line at EOF — stop, don't advance offset
-        };
-        let line_bytes = line.len() as u64 + 1; // +1 for newline
-
-        if line.trim().is_empty() {
-            current_offset += line_bytes;
-            continue;
-        }
-
-        let evt: Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(_) => {
-                // Could be an incomplete write — don't advance past it
-                break;
-            }
-        };
-
-        current_offset += line_bytes;
-        lines_parsed += 1;
-
-        let msg_type = evt.get("type").and_then(|v| v.as_str()).unwrap_or("");
-
-        // Track session ID
-        if session.session_id == "unknown" {
-            if let Some(sid) = evt.get("sessionId").and_then(|v| v.as_str()) {
-                session.session_id = sid.to_string();
-            }
-        }
-
-        // Track timestamps
-        if let Some(ts) = evt.get("timestamp").and_then(|v| v.as_str()) {
-            if session.started_at.is_empty() || ts < session.started_at.as_str() {
-                session.started_at = ts.to_string();
-            }
-            if session.ended_at.is_empty() || ts > session.ended_at.as_str() {
-                session.ended_at = ts.to_string();
-            }
-        }
-
-        match msg_type {
-            "assistant" => {
-                session.message_count += 1;
-
-                // Extract model
-                if let Some(model) = evt.pointer("/message/model").and_then(|v| v.as_str()) {
-                    if session.model.is_empty() || !model.is_empty() {
-                        session.model = model.to_string();
-                    }
-                }
-
-                // Extract requestId and usage for token dedup
-                let request_id = evt.get("requestId").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                if let Some(usage) = evt.pointer("/message/usage") {
-                    let out_tok = usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                    let entry = usage_map.entry(request_id.clone()).or_insert_with(|| UsageAccum {
-                        input_tokens: usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                        cache_read_tokens: usage.get("cache_read_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                        cache_creation_tokens: usage.get("cache_creation_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                        output_tokens: 0,
-                    });
-                    // output_tokens grows across streaming chunks — take max
-                    if out_tok > entry.output_tokens {
-                        entry.output_tokens = out_tok;
-                    }
-                }
-                if !request_id.is_empty() {
-                    last_request_id = request_id;
-                }
-
-                // Tool counting from content blocks
-                if let Some(content) = evt.pointer("/message/content").and_then(|v| v.as_array()) {
-                    for block in content {
-                        if block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
-                            let tool = block.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
-                            *session.tools.entry(tool.to_string()).or_insert(0) += 1;
-                        }
-                    }
-                }
-            }
-
-            "user" => {
-                session.message_count += 1;
-
-                // Real prompt = content is string; tool result = content is array
-                let is_prompt = evt
-                    .pointer("/message/content")
-                    .map(|v| v.is_string())
-                    .unwrap_or(false);
-                if is_prompt {
-                    session.prompt_count += 1;
-                }
-
-                // Extract metadata
-                if let Some(pm) = evt.get("permissionMode").and_then(|v| v.as_str()) {
-                    session.permission_mode = pm.to_string();
-                }
-                if session.project == "unknown" {
-                    if let Some(cwd) = evt.get("cwd").and_then(|v| v.as_str()) {
-                        if let Some(last) = cwd.rsplit('/').next() {
-                            if !last.is_empty() {
-                                session.project = last.to_string();
-                            }
-                        }
-                        if session.path_hash.is_empty() {
-                            session.path_hash = hash_path(cwd);
-                        }
-                    }
-                }
-            }
-
-            "system" => {
-                let subtype = evt.get("subtype").and_then(|v| v.as_str()).unwrap_or("");
-                if subtype == "turn_duration" {
-                    if let Some(ms) = evt.get("durationMs").and_then(|v| v.as_u64()) {
-                        session.total_turn_duration_ms += ms;
-                        session.turn_count += 1;
-                    }
-                }
-            }
-
-            _ => {} // progress, file-history-snapshot, queue-operation, summary — skip
-        }
-    }
-
-    if lines_parsed == 0 {
-        return None;
-    }
-
-    // Resolve token totals from usage_map
-    for (rid, accum) in &usage_map {
-        let mut out = accum.output_tokens;
-        // Handle requestId that spans cursor boundary: subtract previously counted output_tokens
-        if rid == prev_request_id && !prev_request_id.is_empty() {
-            if out > prev_output_tokens {
-                out -= prev_output_tokens;
-            } else {
-                out = 0; // same or lower — already fully counted
-            }
-            // input/cache tokens were already counted in previous read, skip them
+    let name = get("displayName");
+    let registry = projects::read_projects(dir);
+    let active = registry.projects.iter().filter(|p| p.enabled).count();
+    let total = registry.projects.len();
+
+    if json_output {
+        let key_display = if key.len() > 12 {
+            format!("{}...{}", &key[..8], &key[key.len() - 4..])
         } else {
-            session.total_input_tokens += accum.input_tokens;
-            session.total_cache_read_tokens += accum.cache_read_tokens;
-            session.total_cache_creation_tokens += accum.cache_creation_tokens;
-        }
-        session.total_output_tokens += out;
-    }
-
-    // Set hostname
-    session.hostname = gethostname::gethostname()
-        .to_string_lossy()
-        .split('.')
-        .next()
-        .unwrap_or("unknown")
-        .to_string();
-
-    let last_out = usage_map
-        .get(&last_request_id)
-        .map(|a| a.output_tokens)
-        .unwrap_or(0);
-
-    Some((session, current_offset, last_request_id, last_out))
-}
-
-fn post_import_batch(api_base: &str, api_key: &str, sessions: &[Value]) -> Result<(u32, u32), String> {
-    let payload = json!({ "sessions": sessions });
-    let payload_str = serde_json::to_string(&payload).map_err(|e| format!("{e}"))?;
-    let url = format!("{api_base}/sync/import");
-    let (status, body) = http_post(&url, &payload_str, Some(api_key))?;
-    if status != 200 {
-        return Err(format!("HTTP {status}: {body}"));
-    }
-    let resp: Value = serde_json::from_str(&body).map_err(|e| format!("Parse error: {e}"))?;
-    let added = resp.pointer("/data/added").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-    let skipped = resp.pointer("/data/skipped").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-    Ok((added, skipped))
-}
-
-fn cmd_import_from_history(dir: &Path, project_filter: Option<&str>, do_sync: bool) -> i32 {
-    let claude = claude_dir();
-    if !claude.exists() {
-        eprintln!("Claude data directory not found: {}", claude.display());
-        return 1;
-    }
-
-    eprintln!("Scanning {}...", claude.join("projects").display());
-    let mut discovered = discover_sessions(&claude);
-
-    // Filter by project name (case-insensitive substring match)
-    if let Some(filter) = project_filter {
-        let filter_lower = filter.to_lowercase();
-        let before = discovered.len();
-        discovered.retain(|(name, _, _)| name.to_lowercase().contains(&filter_lower));
-        eprintln!("Filter '{}': {} of {} session files match", filter, discovered.len(), before);
-    }
-
-    if discovered.is_empty() {
-        eprintln!("No session files found.");
-        return 1;
-    }
-
-    eprintln!("Found {} session files. Parsing...", discovered.len());
-
-    let output_path = dir.join("history-import.jsonl");
-    let mut out_file = match fs::File::create(&output_path) {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("Cannot create output file: {e}");
-            return 1;
-        }
-    };
-
-    let mut total_sessions = 0u32;
-    let mut total_prompts = 0u32;
-    let mut total_tools = 0u32;
-    let mut projects: HashSet<String> = HashSet::new();
-    let mut earliest = String::new();
-    let mut latest = String::new();
-    let mut all_session_json: Vec<Value> = Vec::new();
-
-    for (i, (project_name, ph, path)) in discovered.iter().enumerate() {
-        let file_name = path.file_name().unwrap_or_default().to_string_lossy();
-        eprint!("\r  [{}/{}] Parsing {}...", i + 1, discovered.len(), file_name);
-
-        let session = match parse_session_transcript(path, project_name, ph) {
-            Some(s) => s,
-            None => continue,
+            key
         };
-
-        // Track stats
-        total_sessions += 1;
-        total_prompts += session.prompt_count;
-        total_tools += session.tools.values().sum::<u32>();
-        projects.insert(session.project.clone());
-
-        if !session.started_at.is_empty() {
-            if earliest.is_empty() || session.started_at < earliest {
-                earliest = session.started_at.clone();
-            }
-            if latest.is_empty() || session.ended_at > latest {
-                latest = session.ended_at.clone();
-            }
-        }
-
-        // Build output JSON
-        let mut obj = json!({
-            "session_id": session.session_id,
-            "project_hash": session.path_hash,
-            "project_name": session.project,
-            "started_at": session.started_at,
-            "ended_at": session.ended_at,
-            "prompt_count": session.prompt_count,
-            "tools": session.tools,
-            "hostname": session.hostname,
-        });
-
-        if !session.permission_mode.is_empty() {
-            obj["permission_mode"] = json!(session.permission_mode);
-        }
-
-        if let (Some(start), Some(end)) = (
-            parse_iso_flex(&session.started_at),
-            parse_iso_flex(&session.ended_at),
-        ) {
-            obj["duration_seconds"] = json!(end - start);
-        }
-
-        let line = serde_json::to_string(&obj).unwrap_or_default();
-        let _ = writeln!(out_file, "{}", line);
-        all_session_json.push(obj);
-    }
-
-    eprintln!("\r                                                              ");
-
-    eprintln!("Done!");
-    eprintln!("  Sessions:  {total_sessions}");
-    eprintln!("  Projects:  {}", projects.len());
-    eprintln!("  Prompts:   {total_prompts}");
-    eprintln!("  Tool calls:{total_tools}");
-    if !earliest.is_empty() {
-        eprintln!("  Range:     {} .. {}", &earliest[..10.min(earliest.len())], &latest[..10.min(latest.len())]);
-    }
-    eprintln!("  Output:    {}", output_path.display());
-
-    // Sync to backend if --sync flag is set
-    if do_sync {
-        let api_key = match config_get(dir, "apiKey") {
-            Some(key) => key,
-            None => {
-                eprintln!("\nNo API key configured. Run: vibenalytics login");
-                return 1;
-            }
+        println!(
+            r#"{{"status":"connected","name":"{}","api_key":"{}","projects_active":{},"projects_total":{}}}"#,
+            name, key_display, active, total
+        );
+    } else {
+        let key_display = if key.len() > 12 {
+            format!("{}...{}", &key[..8], &key[key.len() - 4..])
+        } else {
+            key
         };
-        let api_base = config_get(dir, "apiBase")
-            .unwrap_or_else(|| DEFAULT_API_BASE.to_string());
-
-        eprintln!("\nSyncing to {}...", api_base);
-
-        let batch_size = 50;
-        let mut total_added = 0u32;
-        let mut total_skipped = 0u32;
-        let chunks: Vec<&[Value]> = all_session_json.chunks(batch_size).collect();
-        let num_batches = chunks.len();
-
-        for (batch_idx, chunk) in chunks.iter().enumerate() {
-            eprint!("\r  Batch {}/{} ({} sessions)...", batch_idx + 1, num_batches, chunk.len());
-            match post_import_batch(&api_base, &api_key, chunk) {
-                Ok((added, skipped)) => {
-                    total_added += added;
-                    total_skipped += skipped;
-                }
-                Err(e) => {
-                    eprintln!("\n  Batch {} failed: {}", batch_idx + 1, e);
-                    eprintln!("  {} sessions synced before failure.", total_added);
-                    return 1;
-                }
-            }
-        }
-
-        eprintln!("\r                                                  ");
-        eprintln!("Sync complete!");
-        eprintln!("  Added:   {total_added}");
-        eprintln!("  Skipped: {total_skipped} (already existed)");
+        println!("Configured:");
+        println!("  Name:     {}", name);
+        println!("  API Key:  {}", key_display);
+        println!("  Projects: {} active / {} total", active, total);
     }
-
     0
 }
 
-// ---- Main ----
+fn cmd_project_list(dir: &std::path::Path, json_output: bool) -> i32 {
+    let registry = projects::read_projects(dir);
+
+    if json_output {
+        let json = serde_json::to_string_pretty(&registry).unwrap_or_default();
+        println!("{json}");
+        return 0;
+    }
+
+    if registry.projects.is_empty() {
+        println!("No projects tracked. Run: vibenalytics project add");
+        return 0;
+    }
+
+    println!(
+        "  {:<16} {:<10} {}",
+        "NAME", "STATUS", "PATH"
+    );
+    for p in &registry.projects {
+        let status = if p.enabled { "active" } else { "paused" };
+        println!("  {:<16} {:<10} {}", p.name, status, p.path);
+    }
+    0
+}
 
 fn main() {
-    let args: Vec<String> = env::args().collect();
-    let dir = data_dir();
+    let cli = Cli::parse();
+    let dir = paths::data_dir();
 
-    if args.len() < 2 {
-        eprintln!("Usage:");
-        eprintln!("  vibenalytics log [--use-transcripts]         Log hook event from stdin");
-        eprintln!("  vibenalytics sync [--use-transcripts]        Sync metrics to backend");
-        eprintln!("  vibenalytics login                           Browser-based login");
-        eprintln!("  vibenalytics status                          Show configuration");
-        eprintln!("  vibenalytics aggregate <file>                Output aggregated JSON");
-        eprintln!("  vibenalytics tui                             Interactive TUI dashboard");
-        eprintln!("  vibenalytics import-from-history [project] [--dry]   Parse transcripts + sync (--dry = JSONL only)");
-        std::process::exit(1);
-    }
+    let rc = match cli.command {
+        None => {
+            // No subcommand: launch TUI if interactive, status if piped
+            if std::io::stdout().is_terminal() {
+                tui::run(&dir)
+            } else {
+                cmd_status(&dir, cli.json)
+            }
+        }
 
-    let rc = match args[1].as_str() {
-        "log" => {
-            if args.iter().any(|a| a == "--use-transcripts") {
-                cmd_log_transcripts(&dir)
-            } else {
-                cmd_log(&dir)
-            }
+        Some(Commands::Init) => {
+            // TODO: Implement onboarding wizard (spec section 3)
+            eprintln!("TODO: Onboarding wizard not yet implemented.");
+            eprintln!("For now, use: vibenalytics login && vibenalytics project add");
+            1
         }
-        "sync" => {
-            if args.iter().any(|a| a == "--use-transcripts") {
-                cmd_sync_transcripts(&dir)
-            } else {
-                cmd_sync(&dir)
-            }
-        }
-        "login" => cmd_login_browser(&dir),
-        "status" => cmd_status(&dir),
-        "aggregate" => {
-            if args.len() < 3 {
-                eprintln!("Usage: vibenalytics aggregate <file>");
-                std::process::exit(1);
-            }
-            cmd_aggregate(&args[2])
-        }
-        "tui" => tui::run(&dir),
-        "import-from-history" => {
-            let mut filter: Option<&str> = None;
-            let mut dry_run = false;
-            for arg in &args[2..] {
-                match arg.as_str() {
-                    "--dry" => dry_run = true,
-                    other if filter.is_none() => filter = Some(other),
-                    _ => {}
+
+        Some(Commands::Login) => auth::cmd_login(&dir),
+        Some(Commands::Logout) => auth::cmd_logout(&dir),
+        Some(Commands::Status) => cmd_status(&dir, cli.json),
+
+        Some(Commands::Project { action }) => match action {
+            ProjectAction::List => cmd_project_list(&dir, cli.json),
+
+            ProjectAction::Add { path } => {
+                let p = path.unwrap_or_else(|| {
+                    env::current_dir()
+                        .map(|d| d.to_string_lossy().to_string())
+                        .unwrap_or_else(|_| ".".to_string())
+                });
+                match projects::add_project(&dir, &p) {
+                    Ok(name) => {
+                        println!("Added project \"{}\"", name);
+                        0
+                    }
+                    Err(msg) => {
+                        eprintln!("{msg}");
+                        1
+                    }
                 }
             }
-            cmd_import_from_history(&dir, filter, !dry_run)
+
+            ProjectAction::Remove { name } => {
+                let target = resolve_name_or_cwd(name);
+                match projects::remove_project(&dir, &target) {
+                    Ok(name) => {
+                        println!("Removed \"{}\" from tracking.", name);
+                        0
+                    }
+                    Err(msg) => {
+                        eprintln!("{msg}");
+                        1
+                    }
+                }
+            }
+
+            ProjectAction::Enable { name } => {
+                let target = resolve_name_or_cwd(name);
+                match projects::enable_project(&dir, &target) {
+                    Ok(name) => {
+                        println!("Resumed syncing for \"{}\".", name);
+                        0
+                    }
+                    Err(msg) => {
+                        eprintln!("{msg}");
+                        1
+                    }
+                }
+            }
+
+            ProjectAction::Disable { name } => {
+                let target = resolve_name_or_cwd(name);
+                match projects::disable_project(&dir, &target) {
+                    Ok(name) => {
+                        println!("Paused syncing for \"{}\".", name);
+                        0
+                    }
+                    Err(msg) => {
+                        eprintln!("{msg}");
+                        1
+                    }
+                }
+            }
+        },
+
+        Some(Commands::Sync { use_transcripts, .. }) => {
+            if use_transcripts {
+                sync::cmd_sync_transcripts(&dir)
+            } else {
+                sync::cmd_sync(&dir)
+            }
         }
-        other => {
-            eprintln!("Unknown command: {other}");
-            1
+
+        Some(Commands::Import { project, dry }) => {
+            import::cmd_import(&dir, project.as_deref(), !dry)
+        }
+
+        Some(Commands::Log { use_transcripts }) => {
+            if use_transcripts {
+                log_cmd::cmd_log_transcripts(&dir)
+            } else {
+                log_cmd::cmd_log(&dir)
+            }
         }
     };
 

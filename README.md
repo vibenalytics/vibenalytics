@@ -20,7 +20,7 @@ cargo build --release
 The default API base is `http://localhost:3001/api`. For production builds:
 
 ```bash
-API_BASE=https://api.vibenalytics.dev/api FRONTEND_BASE=https://vibenalytics.dev cargo build --release
+API_BASE=https://api.vibenalytics.dev/api cargo build --release
 ```
 
 ### Symlink for local testing
@@ -54,10 +54,32 @@ ln -sf "$(pwd)/target/release/vibenalytics" ~/.local/bin/vibenalytics
 
 ## Architecture
 
-Single binary, two source files:
+Single binary, modular source:
 
-- `src/main.rs` — CLI entrypoint, hook logging, aggregation, sync, auth, history import
-- `src/tui.rs` — Interactive terminal dashboard (ratatui)
+```
+src/
+  main.rs          — CLI entrypoint (clap derive)
+  config.rs        — Config read/write, compile-time API_BASE
+  auth.rs          — Browser-based OAuth login (non-blocking for TUI)
+  sync.rs          — Aggregation + POST to backend
+  import.rs        — Parse ~/.claude/ transcripts, batch sync
+  transcripts.rs   — Session/project discovery, JSONL parsing
+  aggregation.rs   — Session struct, metrics aggregation
+  log_cmd.rs       — Hook event logging (stdin → metrics.jsonl)
+  hash.rs          — FNV-1a path hashing
+  paths.rs         — Data directory + file path resolution
+  http.rs          — HTTP helpers (ureq)
+  tui/
+    mod.rs         — TUI app loop, state, event handling
+    theme.rs       — Color palette
+    header.rs      — Header bar, tab bar, footer
+    dashboard.rs   — Overview tab
+    sessions.rs    — Sessions tab
+    projects.rs    — Projects tab
+    settings.rs    — Settings tab (actions)
+    import_picker.rs — Project selection for history import
+    overlay.rs     — Modal overlays
+```
 
 ### Key data flow
 
