@@ -7,6 +7,7 @@ on:
 
 env:
   API_BASE: https://api.vibenalytics.dev/api
+  FRONTEND_BASE: https://vibenalytics.dev
   PUBLIC_REPO: vibenalytics/vibenalytics-cli
 
 permissions:
