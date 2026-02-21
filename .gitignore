@@ -1,0 +1,6 @@
+target/
+.DS_Store
+*.jsonl
+*.lock.json
+.sync-config.json
+sync.log
