@@ -1,17 +1,15 @@
-/// claudnalytics v2 — Claudnalytics metrics logger, aggregator and sync client
+/// vibenalytics v2 — Vibenalytics metrics logger, aggregator and sync client
 ///
 /// Single Rust binary. Zero runtime dependencies.
 ///
 /// Usage:
-///   claudnalytics log [--use-transcripts]               Read hook JSON from stdin, strip content, append to metrics.jsonl
-///   claudnalytics sync [--use-transcripts]              Aggregate + POST + flush
-///   claudnalytics login                                Browser-based login (opens browser)
-///   claudnalytics login <email> <password>             Login with credentials
-///   claudnalytics login --api-key <key>                Set API key directly
-///   claudnalytics status                               Show registration
-///   claudnalytics aggregate <file>                     Dump aggregated JSON to stdout
-///   claudnalytics tui                                  Launch interactive TUI dashboard
-///   claudnalytics import-from-history [project] [--dry]   Parse ~/.claude/ transcripts → sync (or --dry for JSONL only)
+///   vibenalytics log [--use-transcripts]               Read hook JSON from stdin, strip content, append to metrics.jsonl
+///   vibenalytics sync [--use-transcripts]              Aggregate + POST + flush
+///   vibenalytics login                                Browser-based login (opens browser)
+///   vibenalytics status                               Show registration
+///   vibenalytics aggregate <file>                     Dump aggregated JSON to stdout
+///   vibenalytics tui                                  Launch interactive TUI dashboard
+///   vibenalytics import-from-history [project] [--dry]   Parse ~/.claude/ transcripts → sync (or --dry for JSONL only)
 
 mod tui;
 use std::collections::{HashMap, HashSet};
@@ -21,9 +19,6 @@ use std::io::{self, BufRead, Read, Seek, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
-
-use std::hash::{Hash, Hasher};
-use std::collections::hash_map::DefaultHasher;
 
 use chrono::Utc;
 use serde_json::{json, Map, Value};
@@ -38,19 +33,37 @@ const DEFAULT_FRONTEND_BASE: &str = match option_env!("FRONTEND_BASE") {
     None => "http://localhost:3000",
 };
 
+/// FNV-1a 64-bit hash — deterministic across all platforms and Rust versions.
 fn hash_path(path: &str) -> String {
-    let mut h = DefaultHasher::new();
-    path.hash(&mut h);
-    format!("{:016x}", h.finish())
+    const FNV_OFFSET: u64 = 14695981039346656037;
+    const FNV_PRIME: u64 = 1099511628211;
+    let mut hash = FNV_OFFSET;
+    for byte in path.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    format!("{:016x}", hash)
 }
 
 // ---- Path helpers ----
 
-/// Returns the directory containing the binary (resolving symlinks).
+/// Returns the data directory for config, metrics, and logs.
+/// Precedence: $XDG_DATA_HOME/vibenalytics → ~/.config/vibenalytics → %APPDATA%\vibenalytics → binary dir
 fn data_dir() -> PathBuf {
-    let exe_raw = env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
-    let exe = fs::canonicalize(&exe_raw).unwrap_or(exe_raw);
-    exe.parent().unwrap_or(Path::new(".")).to_path_buf()
+    let dir = if let Ok(xdg) = env::var("XDG_DATA_HOME") {
+        PathBuf::from(xdg).join("vibenalytics")
+    } else if let Ok(home) = env::var("HOME") {
+        PathBuf::from(home).join(".config").join("vibenalytics")
+    } else if let Ok(appdata) = env::var("APPDATA") {
+        PathBuf::from(appdata).join("vibenalytics")
+    } else {
+        // Last resort: next to the binary
+        let exe_raw = env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
+        let exe = fs::canonicalize(&exe_raw).unwrap_or(exe_raw);
+        exe.parent().unwrap_or(Path::new(".")).to_path_buf()
+    };
+    let _ = fs::create_dir_all(&dir);
+    dir
 }
 
 fn metrics_path(dir: &Path) -> PathBuf {
@@ -649,123 +662,27 @@ fn cmd_aggregate(filepath: &str) -> i32 {
     0
 }
 
-fn cmd_login_with_credentials(dir: &Path, email: &str, password: &str) -> i32 {
-    let api = config_get(dir, "apiBase")
-        .unwrap_or_else(|| DEFAULT_API_BASE.to_string());
-
-    println!("Logging in as \"{email}\"...");
-
-    // Step 1: Login to get JWT
-    let login_body = json!({"email": email, "password": password});
-    let url = format!("{api}/auth/login");
-    let (status, resp) = match http_post(&url, &login_body.to_string(), None) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("Login failed: {e}");
-            return 1;
-        }
-    };
-
-    if status != 200 {
-        eprintln!("Login failed (HTTP {status}): {resp}");
-        return 1;
-    }
-
-    let data: Value = match serde_json::from_str(&resp) {
-        Ok(v) => v,
-        Err(_) => {
-            eprintln!("Invalid response");
-            return 1;
-        }
-    };
-
-    let token = data
-        .pointer("/data/token")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let user_name = data
-        .pointer("/data/user/name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("user");
-
-    if token.is_empty() {
-        eprintln!("No token in response");
-        return 1;
-    }
-
-    // Step 2: Generate API key
-    let key_url = format!("{api}/auth/api-key");
-    let key_resp = ureq::post(&key_url)
-        .set("Content-Type", "application/json")
-        .set("Authorization", &format!("Bearer {token}"))
-        .send_string("{}");
-
-    let api_key = match key_resp {
-        Ok(r) => {
-            let body = r.into_string().unwrap_or_default();
-            let v: Value = serde_json::from_str(&body).unwrap_or_default();
-            v.pointer("/data/apiKey")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string()
-        }
-        Err(e) => {
-            eprintln!("Failed to get API key: {e}");
-            return 1;
-        }
-    };
-
-    if api_key.is_empty() {
-        eprintln!("No API key in response");
-        return 1;
-    }
-
-    let cfg = json!({
-        "apiBase": api,
-        "apiKey": api_key,
-        "displayName": user_name,
-    });
-
-    if let Err(e) = write_config(dir, &cfg) {
-        eprintln!("Failed to write config: {e}");
-        return 1;
-    }
-
-    println!("OK! Logged in successfully.");
-    println!("  Name:     {user_name}");
-    println!("  API Key:  {}...{}", &api_key[..8], &api_key[api_key.len()-4..]);
-    println!("\nSync will now use this identity automatically.");
-
-    sync_log(dir, &format!("Logged in: {user_name}"));
-    0
-}
-
-fn cmd_login_with_key(dir: &Path, api_key: &str) -> i32 {
-    let api = config_get(dir, "apiBase")
-        .unwrap_or_else(|| DEFAULT_API_BASE.to_string());
-
-    let cfg = json!({
-        "apiBase": api,
-        "apiKey": api_key,
-        "displayName": "user",
-    });
-
-    if let Err(e) = write_config(dir, &cfg) {
-        eprintln!("Failed to write config: {e}");
-        return 1;
-    }
-
-    println!("OK! API key saved.");
-    println!("  API Key:  {}...{}", &api_key[..8.min(api_key.len())], &api_key[api_key.len().saturating_sub(4)..]);
-    println!("\nSync will now use this key automatically.");
-
-    sync_log(dir, "API key configured directly");
-    0
-}
-
 fn frontend_url(dir: &Path) -> String {
     config_get(dir, "frontendBase")
         .unwrap_or_else(|| DEFAULT_FRONTEND_BASE.to_string())
+}
+
+/// Generate a random hex nonce for CSRF protection in browser login.
+fn generate_nonce() -> String {
+    // Try /dev/urandom (Unix)
+    if let Ok(mut f) = fs::File::open("/dev/urandom") {
+        let mut buf = [0u8; 16];
+        if io::Read::read_exact(&mut f, &mut buf).is_ok() {
+            return buf.iter().map(|b| format!("{:02x}", b)).collect();
+        }
+    }
+    // Fallback: timestamp nanos + pid (less random but unpredictable enough for localhost)
+    let ts = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let pid = std::process::id();
+    format!("{:016x}{:08x}", ts, pid)
 }
 
 fn cmd_login_browser(dir: &Path) -> i32 {
@@ -781,10 +698,11 @@ fn cmd_login_browser(dir: &Path) -> i32 {
         }
     };
     let port = listener.local_addr().unwrap().port();
+    let nonce = generate_nonce();
 
-    // Step 2: Open browser
+    // Step 2: Open browser with state nonce for CSRF protection
     let frontend = frontend_url(dir);
-    let auth_url = format!("{frontend}/auth/cli?port={port}");
+    let auth_url = format!("{frontend}/auth/cli?port={port}&state={nonce}");
 
     eprintln!("Opening browser for authentication...\n");
     if let Err(e) = open::that(&auth_url) {
@@ -827,7 +745,7 @@ fn cmd_login_browser(dir: &Path) -> i32 {
         return 1;
     }
 
-    // Parse: GET /callback?key=...&name=... HTTP/1.1
+    // Parse: GET /callback?key=...&name=...&state=... HTTP/1.1
     let api_key;
     let user_name;
     if let Some(path) = request_line.split_whitespace().nth(1) {
@@ -839,6 +757,19 @@ fn cmd_login_browser(dir: &Path) -> i32 {
                 Some((kv.next()?.to_string(), urldecode(kv.next().unwrap_or(""))))
             })
             .collect();
+
+        // Verify CSRF nonce
+        let callback_state = params.get("state").cloned().unwrap_or_default();
+        if callback_state != nonce {
+            let err_html = r#"<!DOCTYPE html><html><body><p>Authorization failed: invalid state.</p></body></html>"#;
+            let err_resp = format!("HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", err_html.len(), err_html);
+            let _ = (&stream).write_all(err_resp.as_bytes());
+            let _ = (&stream).flush();
+            drop(stream);
+            eprintln!("\nAuthorization rejected: state mismatch (possible CSRF attempt).");
+            return 1;
+        }
+
         api_key = params.get("key").cloned().unwrap_or_default();
         user_name = params.get("name").cloned().unwrap_or_else(|| "user".to_string());
     } else {
@@ -847,7 +778,7 @@ fn cmd_login_browser(dir: &Path) -> i32 {
     }
 
     // Step 5: Send success HTML response
-    let html = r#"<!DOCTYPE html><html><head><meta charset="utf-8"><title>Claudnalytics</title>
+    let html = r#"<!DOCTYPE html><html><head><meta charset="utf-8"><title>Vibenalytics</title>
 <style>body{font-family:system-ui;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;background:#1a1a2e;color:#e0e0e0}
 .card{text-align:center;padding:2rem;border-radius:12px;background:#252540;border:1px solid #333}.ok{color:#c97856;font-size:1.5rem;margin-bottom:0.5rem}</style>
 </head><body><div class="card"><div class="ok">CLI Authorized!</div><p>You can close this tab and return to your terminal.</p></div></body></html>"#;
@@ -922,7 +853,7 @@ fn cmd_status(dir: &Path) -> i32 {
     let cfg = match read_config(dir) {
         Some(c) => c,
         None => {
-            println!("Not configured. Run: claudnalytics login <email> <password>");
+            println!("Not configured. Run: vibenalytics login");
             return 1;
         }
     };
@@ -1755,7 +1686,7 @@ fn cmd_import_from_history(dir: &Path, project_filter: Option<&str>, do_sync: bo
         let api_key = match config_get(dir, "apiKey") {
             Some(key) => key,
             None => {
-                eprintln!("\nNo API key configured. Run: claudnalytics login <email> <password>");
+                eprintln!("\nNo API key configured. Run: vibenalytics login");
                 return 1;
             }
         };
@@ -1802,15 +1733,13 @@ fn main() {
 
     if args.len() < 2 {
         eprintln!("Usage:");
-        eprintln!("  claudnalytics log [--use-transcripts]         Log hook event from stdin");
-        eprintln!("  claudnalytics sync [--use-transcripts]        Sync metrics to backend");
-        eprintln!("  claudnalytics login                          Browser-based login");
-        eprintln!("  claudnalytics login <email> <password>        Login with credentials");
-        eprintln!("  claudnalytics login --api-key <key>           Set API key directly");
-        eprintln!("  claudnalytics status                          Show configuration");
-        eprintln!("  claudnalytics aggregate <file>                Output aggregated JSON");
-        eprintln!("  claudnalytics tui                             Interactive TUI dashboard");
-        eprintln!("  claudnalytics import-from-history [project] [--dry]   Parse transcripts + sync (--dry = JSONL only)");
+        eprintln!("  vibenalytics log [--use-transcripts]         Log hook event from stdin");
+        eprintln!("  vibenalytics sync [--use-transcripts]        Sync metrics to backend");
+        eprintln!("  vibenalytics login                           Browser-based login");
+        eprintln!("  vibenalytics status                          Show configuration");
+        eprintln!("  vibenalytics aggregate <file>                Output aggregated JSON");
+        eprintln!("  vibenalytics tui                             Interactive TUI dashboard");
+        eprintln!("  vibenalytics import-from-history [project] [--dry]   Parse transcripts + sync (--dry = JSONL only)");
         std::process::exit(1);
     }
 
@@ -1829,19 +1758,11 @@ fn main() {
                 cmd_sync(&dir)
             }
         }
-        "login" => {
-            if args.len() >= 4 && args[2] == "--api-key" {
-                cmd_login_with_key(&dir, &args[3])
-            } else if args.len() >= 4 {
-                cmd_login_with_credentials(&dir, &args[2], &args[3])
-            } else {
-                cmd_login_browser(&dir)
-            }
-        }
+        "login" => cmd_login_browser(&dir),
         "status" => cmd_status(&dir),
         "aggregate" => {
             if args.len() < 3 {
-                eprintln!("Usage: claudnalytics aggregate <file>");
+                eprintln!("Usage: vibenalytics aggregate <file>");
                 std::process::exit(1);
             }
             cmd_aggregate(&args[2])

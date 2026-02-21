@@ -207,19 +207,19 @@ impl App {
 // ---- Rendering ----
 
 const LOGO: &[&str] = &[
-    "  _____ _                 _             _       _   _          ",
-    " / ____| |               | |           | |     | | (_)         ",
-    "| |    | | __ _ _   _  __| |_ __   __ _| |_   _| |_ _  ___ ___ ",
-    "| |    | |/ _` | | | |/ _` | '_ \\ / _` | | | | | __| |/ __/ __|",
-    "| |____| | (_| | |_| | (_| | | | | (_| | | |_| | |_| | (__\\__ \\",
-    " \\_____|_|\\__,_|\\__,_|\\__,_|_| |_|\\__,_|_|\\__, |\\__|_|\\___|___/",
-    "                                            __/ |              ",
-    "                                           |___/               ",
+    "__      ___ _                        _       _   _          ",
+    "\\ \\    / (_) |                      | |     | | (_)         ",
+    " \\ \\  / / _| |__   ___ _ __   __ _ | |_   _| |_ _  ___ ___ ",
+    "  \\ \\/ / | | '_ \\ / _ \\ '_ \\ / _` || | | | | __| |/ __/ __|",
+    "   \\  /  | | |_) |  __/ | | | (_| || | |_| | |_| | (__\\__ \\",
+    "    \\/   |_|_.__/ \\___|_| |_|\\__,_||_|\\__, |\\__|_|\\___|___/",
+    "                                       __/ |               ",
+    "                                      |___/                ",
 ];
 
 fn render_header(frame: &mut Frame, area: Rect) {
     let title = Line::from(vec![
-        Span::styled("  claudnalytics", Style::default().fg(Color::Cyan).bold()),
+        Span::styled("  vibenalytics", Style::default().fg(Color::Cyan).bold()),
         Span::styled("  v2.0", Style::default().fg(Color::DarkGray)),
     ]);
     let block = Block::default()
@@ -601,7 +601,7 @@ fn get_placeholder_content(parent: usize, item: usize) -> Vec<&'static str> {
         (0, 0) => vec![
             "Total sessions today:     12",
             "Total prompts:           847",
-            "Most active project:     claudnalytics",
+            "Most active project:     vibenalytics",
             "Avg session duration:    34m",
         ],
         (0, 1) => vec![
@@ -623,7 +623,7 @@ fn get_placeholder_content(parent: usize, item: usize) -> Vec<&'static str> {
         ],
         (1, 0) => vec![
             "Currently active: 1 session",
-            "Project: claudnalytics/native",
+            "Project: vibenalytics/native",
             "Duration: 12m 34s",
         ],
         (1, 1) => vec![
@@ -637,7 +637,7 @@ fn get_placeholder_content(parent: usize, item: usize) -> Vec<&'static str> {
             "  duration, and permission requests",
         ],
         (2, 0) => vec![
-            "claudnalytics    ████████████████  312",
+            "vibenalytics    ████████████████  312",
             "webgate-api      ██████████        201",
             "frontend         ████████          168",
         ],
