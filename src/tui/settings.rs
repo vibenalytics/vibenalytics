@@ -25,8 +25,20 @@ impl SettingsState {
 }
 
 pub fn render(frame: &mut Frame, area: Rect, state: &SettingsState, user_name: &str, connected: bool, pending_events: usize, default_enabled: bool) {
-    let status_style = if connected { theme::success() } else { theme::dim() };
-    let dot = if connected { "●" } else { "○" };
+    if !connected {
+        let lines = vec![
+            Line::from(""),
+            Line::from(""),
+            Line::from(Span::styled("  You are not logged in.", theme::dim())),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  > ", theme::accent_bold()),
+                Span::styled("Login", theme::accent_bold()),
+            ]),
+        ];
+        frame.render_widget(ratatui::widgets::Paragraph::new(lines), area);
+        return;
+    }
 
     let sync_mode = if default_enabled { "auto (all projects)" } else { "manual (whitelist)" };
 
@@ -34,8 +46,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &SettingsState, user_name: &
         Line::from(""),
         Line::from(vec![
             Span::styled("  Account    ", theme::dim()),
-            Span::styled(dot, status_style),
-            Span::styled(format!(" {user_name}"), theme::text()),
+            Span::styled(format!("● {user_name}"), theme::success()),
         ]),
         Line::from(vec![
             Span::styled("  Sync mode  ", theme::dim()),
@@ -49,15 +60,25 @@ pub fn render(frame: &mut Frame, area: Rect, state: &SettingsState, user_name: &
     ];
 
     let actions = [
-        "Re-authenticate",
         "Force Sync",
         "Import History",
         if default_enabled { "Switch to manual mode" } else { "Switch to auto mode" },
+        "Logout",
     ];
 
     for (i, action) in actions.iter().enumerate() {
+        let is_logout = i == actions.len() - 1;
+        if is_logout {
+            lines.push(Line::from(""));
+        }
         let (marker, style) = if i == state.selected {
-            ("> ", theme::accent_bold())
+            if is_logout {
+                ("> ", Style::default().fg(theme::ERROR).add_modifier(ratatui::style::Modifier::BOLD))
+            } else {
+                ("> ", theme::accent_bold())
+            }
+        } else if is_logout {
+            ("  ", Style::default().fg(theme::ERROR))
         } else {
             ("  ", theme::dim())
         };

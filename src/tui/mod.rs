@@ -221,6 +221,16 @@ impl App {
             return;
         }
 
+        // Not logged in — only allow login or quit
+        if !self.connected {
+            match key {
+                KeyCode::Enter => self.start_login(),
+                KeyCode::Esc => { self.should_quit = true; }
+                _ => {}
+            }
+            return;
+        }
+
         match key {
             KeyCode::Esc => {
                 if self.tab == Tab::Projects && self.projects_state.has_changes() {
@@ -259,7 +269,13 @@ impl App {
             }
             KeyCode::Enter => {
                 match self.tab {
-                    Tab::Settings => self.handle_settings_action(),
+                    Tab::Settings => {
+                        if !self.connected {
+                            self.start_login();
+                        } else {
+                            self.handle_settings_action();
+                        }
+                    }
                     Tab::Projects => {
                         if self.projects_state.has_changes() {
                             self.status_msg = self.projects_state.save(&self.dir);
@@ -272,22 +288,26 @@ impl App {
         }
     }
 
+    fn start_login(&mut self) {
+        match crate::auth::start_login() {
+            Ok(listener) => {
+                let port = listener.listener.local_addr().map(|a| a.port()).unwrap_or(0);
+                let url = format!("{}/auth/cli?port={port}&state={}", crate::config::DEFAULT_FRONTEND_BASE, listener.nonce);
+                self.status_msg = format!("Opening browser... If it didn't open, visit: {url}");
+                self.login_state = Some(listener);
+            }
+            Err(e) => {
+                self.status_msg = format!("Login failed: {e}");
+            }
+        }
+    }
+
     fn handle_settings_action(&mut self) {
+        if !self.connected {
+            return;
+        }
         match self.settings_state.selected {
             0 => {
-                match crate::auth::start_login() {
-                    Ok(listener) => {
-                        let port = listener.listener.local_addr().map(|a| a.port()).unwrap_or(0);
-                        let url = format!("{}/auth/cli?port={port}&state={}", crate::config::DEFAULT_FRONTEND_BASE, listener.nonce);
-                        self.status_msg = format!("Opening browser... If it didn't open, visit: {url}");
-                        self.login_state = Some(listener);
-                    }
-                    Err(e) => {
-                        self.status_msg = format!("Login failed: {e}");
-                    }
-                }
-            }
-            1 => {
                 let rc = crate::sync::cmd_sync(&self.dir);
                 self.status_msg = if rc == 0 {
                     "Sync complete".into()
@@ -296,7 +316,7 @@ impl App {
                 };
                 self.reload();
             }
-            2 => {
+            1 => {
                 match import_picker::ImportPickerState::new() {
                     Some(picker) => {
                         self.import_picker = Some(picker);
@@ -306,7 +326,7 @@ impl App {
                     }
                 }
             }
-            3 => {
+            2 => {
                 let mut registry = crate::projects::read_projects(&self.dir);
                 registry.default_enabled = !registry.default_enabled;
                 match crate::projects::write_projects(&self.dir, &registry) {
@@ -319,6 +339,11 @@ impl App {
                         self.status_msg = format!("Failed to save: {e}");
                     }
                 }
+            }
+            3 => {
+                crate::auth::cmd_logout(&self.dir);
+                self.status_msg = "Logged out".into();
+                self.reload();
             }
             _ => {}
         }
@@ -401,9 +426,9 @@ pub fn run(dir: &Path) -> i32 {
                 let layout = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([
-                        Constraint::Length(1),
+                        Constraint::Length(3),  // header (margin + text)
                         Constraint::Min(6),
-                        Constraint::Length(1),
+                        Constraint::Length(2),  // footer (separator + hints)
                     ])
                     .split(size);
 
@@ -431,9 +456,9 @@ pub fn run(dir: &Path) -> i32 {
                 let layout = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([
-                        Constraint::Length(1),  // header
+                        Constraint::Length(3),  // header
                         Constraint::Min(6),    // picker content
-                        Constraint::Length(1),  // footer
+                        Constraint::Length(2),  // footer
                     ])
                     .split(size);
 
@@ -450,24 +475,69 @@ pub fn run(dir: &Path) -> i32 {
                 return;
             }
 
+            // Not logged in — show login screen
+            if !app.connected {
+                let layout = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(3),  // header
+                        Constraint::Min(6),    // login content
+                        Constraint::Length(1),  // status
+                        Constraint::Length(2),  // footer
+                    ])
+                    .split(size);
+
+                header::render_header(frame, layout[0], &app.user_name, app.connected);
+
+                let lines = vec![
+                    Line::from(""),
+                    Line::from(""),
+                    Line::from(Span::styled("  Welcome to Vibenalytics", theme::text())),
+                    Line::from(""),
+                    Line::from(Span::styled("  Log in to start tracking your Claude Code usage.", theme::dim())),
+                    Line::from(""),
+                    Line::from(""),
+                    Line::from(vec![
+                        Span::styled("  > ", theme::accent_bold()),
+                        Span::styled("Login", theme::accent_bold()),
+                    ]),
+                ];
+                frame.render_widget(ratatui::widgets::Paragraph::new(lines), layout[1]);
+
+                if !app.status_msg.is_empty() {
+                    let status_line = ratatui::widgets::Paragraph::new(
+                        Line::from(Span::styled(format!("  {}", &app.status_msg), theme::accent_bold()))
+                    );
+                    frame.render_widget(status_line, layout[2]);
+                }
+
+                let hints = if app.login_state.is_some() {
+                    "esc cancel login"
+                } else {
+                    "enter login  esc quit"
+                };
+                header::render_footer(frame, layout[3], hints);
+                return;
+            }
+
             let has_status = !app.status_msg.is_empty();
             let layout = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints(if has_status {
                     vec![
-                        Constraint::Length(1),
-                        Constraint::Length(1),
-                        Constraint::Min(6),
-                        Constraint::Length(1),
-                        Constraint::Length(1),
+                        Constraint::Length(3),  // header (margin + text)
+                        Constraint::Length(2),  // tab bar (labels + underline)
+                        Constraint::Min(6),     // content
+                        Constraint::Length(1),  // status message
+                        Constraint::Length(2),  // footer (separator + hints)
                     ]
                 } else {
                     vec![
-                        Constraint::Length(1),
-                        Constraint::Length(1),
+                        Constraint::Length(3),
+                        Constraint::Length(2),
                         Constraint::Min(6),
                         Constraint::Length(0),
-                        Constraint::Length(1),
+                        Constraint::Length(2),
                     ]
                 })
                 .split(size);
