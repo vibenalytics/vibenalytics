@@ -46,6 +46,7 @@ struct Cli {
     /// Machine-readable JSON output
     #[arg(long, global = true)]
     json: bool,
+
 }
 
 #[derive(Subcommand)]

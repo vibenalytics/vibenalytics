@@ -5,14 +5,16 @@ use std::path::{Path, PathBuf};
 use chrono::Utc;
 
 /// Returns the data directory for config, metrics, and logs.
-/// Precedence: $XDG_DATA_HOME/vibenalytics → ~/.config/vibenalytics → %APPDATA%\vibenalytics → binary dir
+/// Uses compile-time APP_NAME to determine the directory name.
+/// Precedence: $XDG_DATA_HOME/{APP_NAME} → ~/.config/{APP_NAME} → %APPDATA%\{APP_NAME} → binary dir
 pub fn data_dir() -> PathBuf {
+    let name = crate::config::APP_NAME;
     let dir = if let Ok(xdg) = env::var("XDG_DATA_HOME") {
-        PathBuf::from(xdg).join("vibenalytics")
+        PathBuf::from(xdg).join(name)
     } else if let Ok(home) = env::var("HOME") {
-        PathBuf::from(home).join(".config").join("vibenalytics")
+        PathBuf::from(home).join(".config").join(name)
     } else if let Ok(appdata) = env::var("APPDATA") {
-        PathBuf::from(appdata).join("vibenalytics")
+        PathBuf::from(appdata).join(name)
     } else {
         let exe_raw = env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
         let exe = fs::canonicalize(&exe_raw).unwrap_or(exe_raw);

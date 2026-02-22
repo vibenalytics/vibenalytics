@@ -9,6 +9,11 @@ pub const DEFAULT_API_BASE: &str = match option_env!("API_BASE") {
     None => "http://localhost:3001/api",
 };
 
+pub const APP_NAME: &str = match option_env!("APP_NAME") {
+    Some(name) => name,
+    None => "vibenalytics",
+};
+
 pub const DEFAULT_FRONTEND_BASE: &str = match option_env!("FRONTEND_BASE") {
     Some(url) => url,
     None => "http://localhost:3000",

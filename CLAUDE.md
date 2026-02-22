@@ -6,9 +6,21 @@ Native Rust CLI for Claude Code usage analytics. Single binary, zero runtime dep
 
 ```
 src/
-  main.rs    — CLI entrypoint, all commands, hook logging, aggregation, sync, auth
-  tui.rs     — Interactive TUI dashboard (ratatui + crossterm)
-Cargo.toml   — Package config, dependencies, release profile
+  main.rs         — CLI entrypoint, arg parsing, command dispatch
+  log_cmd.rs      — Hook event handler (stdin → strip → metrics.jsonl)
+  sync.rs         — Sync engine (aggregate → POST → archive)
+  aggregation.rs  — Session aggregation from JSONL events
+  config.rs       — Compile-time constants (API_BASE, APP_NAME, FRONTEND_BASE)
+  paths.rs        — Data directory resolution, file path helpers
+  auth.rs         — Login/logout (browser-based + credential-based)
+  http.rs         — HTTP client (ureq wrapper)
+  hash.rs         — FNV-1a path hashing
+  projects.rs     — Project registry (enable/disable/filter)
+  transcripts.rs  — Claude transcript parser
+  import.rs       — History import from ~/.claude/
+  update.rs       — Self-update command
+  tui/            — Interactive TUI dashboard (ratatui + crossterm)
+Cargo.toml        — Package config, dependencies, release profile
 ```
 
 ## Tech Stack
@@ -33,22 +45,40 @@ vibenalytics status                               Show configuration (API base, 
 vibenalytics aggregate <file>                     Dump aggregated JSON to stdout (debug)
 vibenalytics tui                                  Launch interactive TUI dashboard
 vibenalytics import-from-history [project] [--dry]  Parse ~/.claude/ transcripts → sync (--dry = JSONL only)
+vibenalytics project list|enable|disable|add      Manage project tracking
+vibenalytics update                               Self-update to latest release
 ```
 
 ## Build Configuration
 
-API base URL is set at **compile time** via environment variable:
+Three compile-time constants set via environment variables:
 
 ```rust
-const DEFAULT_API_BASE: &str = match option_env!("API_BASE") {
-    Some(url) => url,
-    None => "http://localhost:3001/api",
-};
+const APP_NAME: &str          // "vibenalytics" | "vibenalytics-dev"  → data dir name
+const DEFAULT_API_BASE: &str  // API endpoint URL
+const FRONTEND_BASE: &str     // Frontend URL (for login redirect)
 ```
 
-- **Local dev:** `cargo build --release` (defaults to localhost:3001)
-- **Production:** `API_BASE=https://api.vibenalytics.dev/api cargo build --release`
-- **Runtime override:** `.sync-config.json` `apiBase` field overrides the compiled default
+### Local dev build
+```bash
+APP_NAME=vibenalytics-dev cargo build --release
+# Defaults: API → localhost:3001, data dir → ~/.config/vibenalytics-dev/
+```
+
+### Production build (CI)
+```bash
+APP_NAME=vibenalytics API_BASE=https://api.vibenalytics.dev/api FRONTEND_BASE=https://app.vibenalytics.dev cargo build --release
+# Data dir → ~/.config/vibenalytics/
+```
+
+### Dev binary setup
+```bash
+ln -sf target/release/vibenalytics ~/.local/bin/vibenalytics-dev
+```
+
+The dev binary (`vibenalytics-dev`) and production binary (`vibenalytics`) use **separate data directories** determined by `APP_NAME` at compile time. They can run side-by-side via the Claude Code plugin system (production plugin from marketplace, dev plugin from local marketplace).
+
+- **Runtime override:** `.sync-config.json` `apiBase` field overrides the compiled `DEFAULT_API_BASE`
 
 ## Data Flow
 
@@ -56,8 +86,8 @@ const DEFAULT_API_BASE: &str = match option_env!("API_BASE") {
 1. Claude Code hooks pipe event JSON to `vibenalytics log` via stdin (async, ~1ms)
 2. Content fields are stripped (only metadata/byte counts kept), appended to `metrics.jsonl`
 3. Auto-sync triggers on boundary events (`SessionStart`, `SessionEnd`, `Stop`, `UserPromptSubmit`) or buffer >= 10 events
-4. `vibenalytics sync` aggregates events into per-session summaries, POSTs to `/api/sync`
-5. On success, `metrics.jsonl` is archived and flushed
+4. `vibenalytics sync` atomically stages `metrics.jsonl` → aggregates → POSTs to `/api/sync`
+5. On success, staged file is archived; on failure, data is prepended back for retry
 
 ### Transcript-based (alternative)
 1. `--use-transcripts` flag reads Claude Code session transcripts directly from `~/.claude/projects/`
@@ -70,8 +100,9 @@ const DEFAULT_API_BASE: &str = match option_env!("API_BASE") {
 - **Path hashing:** Workdir paths are FNV-1a hashed (16 hex chars) — raw paths never leave the machine
 - **Content stripping:** `strip_field_bytes()` replaces content with `{_bytes, _type}` stubs
 - **Command preview:** Bash commands keep first token (binary name) + 80-char preview
+- **Atomic staging:** Sync renames `metrics.jsonl` → `metrics.staging.jsonl` before reading to prevent race conditions between concurrent hook processes
 - **Lock files:** Both sync paths use lock files with 60s staleness check
-- **Config resolution:** `data_dir()` resolves symlinks via `fs::canonicalize()` — config lives next to the real binary
+- **Data directory:** `data_dir()` uses compile-time `APP_NAME` → `~/.config/{APP_NAME}/`
 
 ## Auth Flow
 
@@ -109,6 +140,7 @@ const DEFAULT_API_BASE: &str = match option_env!("API_BASE") {
 
 GitHub Actions (`.github/workflows/release.yml`):
 - Triggers on tag push (`v*`)
+- Sets `APP_NAME`, `API_BASE`, `FRONTEND_BASE` env vars for production build
 - Cross-compiles for 4 targets: darwin-arm64, darwin-x64, linux-x64, linux-arm64
 - Generates checksums.json
 - Publishes release assets to the **public** repo `vibenalytics/vibenalytics-cli`
@@ -116,9 +148,10 @@ GitHub Actions (`.github/workflows/release.yml`):
 
 ## Key Conventions
 
-- Binary name: `vibenalytics` (Cargo.toml `[package] name`)
-- Config file: `.sync-config.json` (next to binary, resolved through symlinks)
-- Metrics file: `metrics.jsonl` (next to binary)
-- Sync log: `sync.log` (next to binary)
+- Binary name: `vibenalytics` (prod) / `vibenalytics-dev` (dev)
+- Data directory: `~/.config/{APP_NAME}/` (compile-time)
+- Config file: `.sync-config.json` (in data dir)
+- Metrics file: `metrics.jsonl` (in data dir)
+- Sync log: `sync.log` (in data dir)
 - All timestamps: UTC, ISO 8601 format (`%Y-%m-%dT%H:%M:%SZ`)
 - API auth: `X-API-Key` header with `clk_`-prefixed key
