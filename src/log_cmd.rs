@@ -135,17 +135,26 @@ pub fn cmd_log(dir: &Path) -> i32 {
         }
     }
 
+    let tool_name = obj.get("tool_name").and_then(|v| v.as_str()).unwrap_or("-").to_string();
+    let session_short = obj.get("session_id").and_then(|v| v.as_str()).unwrap_or("?")
+        .get(..12).unwrap_or("?").to_string();
+
     let path = metrics_path(dir);
     if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) {
         let _ = writeln!(f, "{}", serde_json::to_string(&evt).unwrap_or_default());
     }
 
     let is_boundary = SYNC_EVENTS.contains(&event_name.as_str());
-    let line_count = fs::read_to_string(&path)
+    let approx_lines = fs::read_to_string(&path)
         .map(|c| c.lines().filter(|l| !l.trim().is_empty()).count())
         .unwrap_or(0);
 
-    if is_boundary || line_count >= SYNC_BUFFER_THRESHOLD {
+    crate::paths::sync_log(dir, &format!(
+        "[hook] {} tool={} session={} boundary={} buffer={}",
+        event_name, tool_name, session_short, is_boundary, approx_lines
+    ));
+
+    if is_boundary || approx_lines >= SYNC_BUFFER_THRESHOLD {
         cmd_sync(dir);
     }
 

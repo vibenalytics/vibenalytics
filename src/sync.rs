@@ -24,14 +24,6 @@ pub fn cmd_sync(dir: &Path) -> i32 {
     let api_base = DEFAULT_API_BASE;
 
     let mp = metrics_path(dir);
-    match fs::metadata(&mp) {
-        Ok(m) if m.len() > 0 => {}
-        _ => {
-            sync_log(dir, "No metrics to sync");
-            return 0;
-        }
-    };
-
     let lock = mp.with_extension("jsonl.lock");
     if lock.exists() {
         if let Ok(lm) = fs::metadata(&lock) {
@@ -52,22 +44,68 @@ pub fn cmd_sync(dir: &Path) -> i32 {
 
     let _ = fs::write(&lock, format!("{}", std::process::id()));
 
-    let sessions = aggregate_file(&mp);
+    // Recover orphaned staging file from a previous crash
+    let staging = mp.with_extension("staging.jsonl");
+    if staging.exists() {
+        if let Ok(staged_data) = fs::read_to_string(&staging) {
+            if !staged_data.trim().is_empty() {
+                let existing = fs::read_to_string(&mp).unwrap_or_default();
+                let _ = fs::write(&mp, format!("{staged_data}{existing}"));
+                sync_log(dir, "Recovered orphaned staging file");
+            }
+        }
+        let _ = fs::remove_file(&staging);
+    }
+
+    // Re-check: metrics file might not exist or be empty
+    match fs::metadata(&mp) {
+        Ok(m) if m.len() > 0 => {}
+        _ => {
+            let _ = fs::remove_file(&lock);
+            return 0;
+        }
+    }
+
+    // Atomically swap: rename metrics.jsonl → staging so new events
+    // go to a fresh file while we sync the old batch.
+    let file_size = fs::metadata(&mp).map(|m| m.len()).unwrap_or(0);
+    sync_log(dir, &format!("Staging metrics.jsonl ({file_size} bytes)"));
+    if fs::rename(&mp, &staging).is_err() {
+        sync_log(dir, "Failed to stage metrics file");
+        let _ = fs::remove_file(&lock);
+        return 0;
+    }
+
+    let sessions = aggregate_file(&staging);
+    let pre_filter = sessions.len();
     let sessions = crate::projects::filter_sessions_by_enabled(dir, sessions);
 
     if sessions.is_empty() {
-        sync_log(dir, "No sessions to sync");
+        sync_log(dir, &format!("No enabled sessions to sync ({pre_filter} filtered out)"));
+        let _ = fs::rename(&staging, &mp);
         let _ = fs::remove_file(&lock);
         return 0;
+    }
+
+    // Log detailed session info
+    for s in &sessions {
+        let tool_count: u32 = s.tools.values().sum();
+        sync_log(dir, &format!(
+            "  session={} project={} prompts={} tools={} events={} input_bytes={} response_bytes={}",
+            &s.session_id[..s.session_id.len().min(12)],
+            s.project, s.prompt_count, tool_count,
+            s.events.values().sum::<u32>(),
+            s.total_input_bytes, s.total_response_bytes
+        ));
     }
 
     let payload = build_payload(&sessions);
     let payload_str = serde_json::to_string(&payload).unwrap_or_default();
     let n = sessions.len();
 
-    sync_log(dir, &format!("Syncing {n} sessions"));
-
     let url = format!("{api_base}/sync");
+    sync_log(dir, &format!("POST {url} — {n} sessions, {} bytes payload", payload_str.len()));
+
     let result = http_post(&url, &payload_str, Some(&api_key));
 
     let rc = match result {
@@ -75,12 +113,11 @@ pub fn cmd_sync(dir: &Path) -> i32 {
             sync_log(dir, &format!("Sync OK: {resp}"));
             let ts = Utc::now().format("%Y%m%d_%H%M%S");
             let archive = dir.join(format!("metrics.synced.{ts}.jsonl"));
-            let _ = fs::rename(&mp, &archive);
-            let _ = fs::write(&mp, "");
+            let _ = fs::rename(&staging, &archive);
             sync_log(
                 dir,
                 &format!(
-                    "Flushed metrics.jsonl, archived to {}",
+                    "Archived to {}",
                     archive.file_name().unwrap_or_default().to_string_lossy()
                 ),
             );
@@ -88,10 +125,22 @@ pub fn cmd_sync(dir: &Path) -> i32 {
         }
         Ok((code, resp)) => {
             sync_log(dir, &format!("Sync FAILED (HTTP {code}): {resp}"));
+            // Prepend staging data back so it's retried next sync
+            if let Ok(staged_data) = fs::read_to_string(&staging) {
+                let existing = fs::read_to_string(&mp).unwrap_or_default();
+                let _ = fs::write(&mp, format!("{staged_data}{existing}"));
+            }
+            let _ = fs::remove_file(&staging);
             1
         }
         Err(e) => {
             sync_log(dir, &format!("Sync FAILED: {e}"));
+            // Prepend staging data back so it's retried next sync
+            if let Ok(staged_data) = fs::read_to_string(&staging) {
+                let existing = fs::read_to_string(&mp).unwrap_or_default();
+                let _ = fs::write(&mp, format!("{staged_data}{existing}"));
+            }
+            let _ = fs::remove_file(&staging);
             1
         }
     };
@@ -176,20 +225,34 @@ pub fn cmd_sync_transcripts(dir: &Path) -> i32 {
         }
     }
 
+    let pre_filter = sessions.len();
     let sessions = crate::projects::filter_sessions_by_enabled(dir, sessions);
 
     if sessions.is_empty() {
+        if pre_filter > 0 {
+            sync_log(dir, &format!("[transcripts] No enabled sessions ({pre_filter} filtered out)"));
+        }
         let _ = fs::remove_file(&lock);
         return 0;
+    }
+
+    for s in &sessions {
+        let tool_count: u32 = s.tools.values().sum();
+        sync_log(dir, &format!(
+            "[transcripts]   session={} project={} prompts={} tools={} tokens_in={} tokens_out={} model={}",
+            &s.session_id[..s.session_id.len().min(12)],
+            s.project, s.prompt_count, tool_count,
+            s.total_input_tokens, s.total_output_tokens, s.model
+        ));
     }
 
     let payload = build_payload(&sessions);
     let payload_str = serde_json::to_string(&payload).unwrap_or_default();
     let n = sessions.len();
 
-    sync_log(dir, &format!("[transcripts] Syncing {n} sessions"));
-
     let url = format!("{api_base}/sync");
+    sync_log(dir, &format!("[transcripts] POST {url} — {n} sessions, {} bytes payload", payload_str.len()));
+
     let result = http_post(&url, &payload_str, Some(&api_key));
 
     let rc = match result {
