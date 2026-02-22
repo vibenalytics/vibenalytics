@@ -41,3 +41,12 @@ pub fn success() -> Style {
 pub fn warning() -> Style {
     Style::default().fg(WARNING)
 }
+
+pub fn spinner_char() -> char {
+    const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    SPINNER[(ms / 80) as usize % SPINNER.len()]
+}

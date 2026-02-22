@@ -1,10 +1,12 @@
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::mpsc;
 use std::time::SystemTime;
 use ratatui::prelude::*;
 use super::theme;
 use crate::paths::claude_dir;
 use crate::transcripts::discover_projects;
+use crate::import::ImportProgress;
 
 pub struct ImportPickerState {
     pub projects: Vec<ImportEntry>,
@@ -24,6 +26,10 @@ pub struct ImportEntry {
 
 pub enum ImportPhase {
     Selecting,
+    Importing {
+        rx: mpsc::Receiver<ImportProgress>,
+        status: String,
+    },
     Done(String),
 }
 
@@ -129,9 +135,34 @@ impl ImportPickerState {
             return;
         }
 
-        match crate::import::run_import(dir, Some(&selected), true) {
-            Ok(msg) => self.phase = ImportPhase::Done(msg),
-            Err(e) => self.phase = ImportPhase::Done(format!("Error: {e}")),
+        let rx = crate::import::start_import(dir.to_path_buf(), selected);
+        self.phase = ImportPhase::Importing {
+            rx,
+            status: "Starting import...".into(),
+        };
+    }
+
+    pub fn poll_progress(&mut self) {
+        let next_phase = if let ImportPhase::Importing { rx, status } = &mut self.phase {
+            loop {
+                match rx.try_recv() {
+                    Ok(ImportProgress::Parsing { total_files }) => {
+                        *status = format!("Parsing {} session files...", total_files);
+                    }
+                    Ok(ImportProgress::Syncing { batch, total_batches }) => {
+                        *status = format!("Syncing batch {}/{}...", batch, total_batches);
+                    }
+                    Ok(ImportProgress::Done(msg)) => {
+                        break Some(ImportPhase::Done(msg));
+                    }
+                    Err(_) => break None,
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(phase) = next_phase {
+            self.phase = phase;
         }
     }
 }
@@ -230,6 +261,14 @@ pub fn render(frame: &mut Frame, area: Rect, state: &mut ImportPickerState) {
                 ),
                 theme::dim(),
             )));
+        }
+        ImportPhase::Importing { status, .. } => {
+            let spinner = theme::spinner_char();
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {spinner} "), theme::accent_bold()),
+                Span::styled(status.as_str(), theme::text()),
+            ]));
+            lines.push(Line::from(""));
         }
         ImportPhase::Done(msg) => {
             lines.push(Line::from(Span::styled(format!("  {msg}"), theme::accent_bold())));

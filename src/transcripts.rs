@@ -183,7 +183,8 @@ pub fn parse_session_transcript(filepath: &Path, fallback_project: &str, fallbac
 
     let mut session = Session::new("unknown");
     session.project = fallback_project.to_string();
-    session.path_hash = fallback_path_hash.to_string();
+    // path_hash left empty — will be set from transcript cwd if available,
+    // otherwise falls back to the directory-derived hash after parsing.
 
     for line_result in reader.lines() {
         let line = match line_result {
@@ -262,6 +263,11 @@ pub fn parse_session_transcript(filepath: &Path, fallback_project: &str, fallbac
         return None;
     }
 
+    // Fall back to directory-derived hash if transcript had no cwd
+    if session.path_hash.is_empty() {
+        session.path_hash = fallback_path_hash.to_string();
+    }
+
     session.hostname = gethostname::gethostname()
         .to_string_lossy()
         .split('.')
@@ -298,7 +304,8 @@ pub fn parse_transcript_from_offset(
 
     let mut session = Session::new("unknown");
     session.project = fallback_project.to_string();
-    session.path_hash = fallback_path_hash.to_string();
+    // path_hash left empty — will be set from transcript cwd if available,
+    // otherwise falls back to the directory-derived hash after parsing.
 
     let mut usage_map: HashMap<String, UsageAccum> = HashMap::new();
     let mut last_request_id = String::new();
@@ -387,7 +394,7 @@ pub fn parse_transcript_from_offset(
                 if let Some(pm) = evt.get("permissionMode").and_then(|v| v.as_str()) {
                     session.permission_mode = pm.to_string();
                 }
-                if session.project == "unknown" {
+                if session.project == fallback_project || session.project == "unknown" {
                     if let Some(cwd) = evt.get("cwd").and_then(|v| v.as_str()) {
                         if let Some(last) = cwd.rsplit('/').next() {
                             if !last.is_empty() {
@@ -415,6 +422,11 @@ pub fn parse_transcript_from_offset(
 
     if lines_parsed == 0 {
         return None;
+    }
+
+    // Fall back to directory-derived hash if transcript had no cwd
+    if session.path_hash.is_empty() {
+        session.path_hash = fallback_path_hash.to_string();
     }
 
     for (rid, accum) in &usage_map {

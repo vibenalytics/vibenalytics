@@ -163,14 +163,17 @@ impl App {
                         let do_import = ob.import_cursor == 0;
                         let dir = self.dir.clone();
                         ob.finish(&dir, do_import);
-                        self.reload();
+                        // reload immediately for non-import case (skip import / no projects)
+                        if !do_import || matches!(&ob.step, onboarding::Step::Done(_)) {
+                            self.reload();
+                        }
                     }
                     KeyCode::Esc => {
                         ob.step = onboarding::Step::ProjectSelection;
                     }
                     _ => {}
                 },
-                onboarding::Step::Importing => {}
+                onboarding::Step::Importing { .. } => {}
                 onboarding::Step::Done(_) => {
                     if key == KeyCode::Enter || key == KeyCode::Esc {
                         self.onboarding = None;
@@ -198,11 +201,11 @@ impl App {
                         KeyCode::Enter => {
                             let dir = self.dir.clone();
                             picker.run_import(&dir);
-                            self.reload();
                         }
                         _ => {}
                     }
                 }
+                import_picker::ImportPhase::Importing { .. } => {}
                 import_picker::ImportPhase::Done(_) => {
                     if key == KeyCode::Esc || key == KeyCode::Enter {
                         self.import_picker = None;
@@ -349,6 +352,23 @@ impl App {
         }
     }
 
+    fn poll_import(&mut self) {
+        if let Some(ref mut picker) = self.import_picker {
+            let was_importing = matches!(&picker.phase, import_picker::ImportPhase::Importing { .. });
+            picker.poll_progress();
+            if was_importing && matches!(&picker.phase, import_picker::ImportPhase::Done(_)) {
+                self.reload();
+            }
+        }
+        if let Some(ref mut ob) = self.onboarding {
+            let was_importing = matches!(&ob.step, onboarding::Step::Importing { .. });
+            ob.poll_import();
+            if was_importing && matches!(&ob.step, onboarding::Step::Done(_)) {
+                self.reload();
+            }
+        }
+    }
+
     fn poll_login(&mut self) {
         if let Some(ref login) = self.login_state {
             match crate::auth::poll_login(login) {
@@ -417,6 +437,7 @@ pub fn run(dir: &Path) -> i32 {
         }
 
         app.poll_login();
+        app.poll_import();
 
         let _ = terminal.draw(|frame| {
             let size = frame.area();
@@ -442,7 +463,7 @@ pub fn run(dir: &Path) -> i32 {
                         "↑/↓ navigate  space toggle  a all  n none  enter confirm  esc back",
                     onboarding::Step::ImportPrompt =>
                         "↑/↓ select  enter confirm  esc back",
-                    onboarding::Step::Importing =>
+                    onboarding::Step::Importing { .. } =>
                         "importing...",
                     onboarding::Step::Done(_) =>
                         "enter continue",
@@ -468,6 +489,8 @@ pub fn run(dir: &Path) -> i32 {
                 let hints = match &picker.phase {
                     import_picker::ImportPhase::Selecting =>
                         "↑/↓ navigate  space toggle  a all  n none  enter import  esc cancel",
+                    import_picker::ImportPhase::Importing { .. } =>
+                        "importing...",
                     import_picker::ImportPhase::Done(_) =>
                         "esc return",
                 };

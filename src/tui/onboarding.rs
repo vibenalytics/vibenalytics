@@ -1,9 +1,11 @@
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::mpsc;
 use std::time::SystemTime;
 use ratatui::prelude::*;
 use super::theme;
 use crate::paths::claude_dir;
+use crate::import::ImportProgress;
 use crate::transcripts::{discover_projects, discover_sessions, parse_session_transcript};
 
 // ---- Steps ----
@@ -12,7 +14,10 @@ pub enum Step {
     SyncMode,
     ProjectSelection,
     ImportPrompt,
-    Importing,
+    Importing {
+        rx: mpsc::Receiver<ImportProgress>,
+        status: String,
+    },
     Done(String),
 }
 
@@ -252,19 +257,41 @@ impl OnboardingState {
             return;
         }
 
-        self.step = Step::Importing;
-
         let selected_dirs = self.selected_dir_names();
         if selected_dirs.is_empty() {
             self.step = Step::Done("Setup complete! No projects to import.".to_string());
             return;
         }
 
-        let result = match crate::import::run_import(dir, Some(&selected_dirs), true) {
-            Ok(msg) => format!("Setup complete! {msg}"),
-            Err(e) => format!("Setup complete (import error: {e})"),
+        let rx = crate::import::start_import(dir.to_path_buf(), selected_dirs);
+        self.step = Step::Importing {
+            rx,
+            status: "Starting import...".into(),
         };
-        self.step = Step::Done(result);
+    }
+
+    pub fn poll_import(&mut self) {
+        let next_step = if let Step::Importing { rx, status } = &mut self.step {
+            loop {
+                match rx.try_recv() {
+                    Ok(ImportProgress::Parsing { total_files }) => {
+                        *status = format!("Parsing {} session files...", total_files);
+                    }
+                    Ok(ImportProgress::Syncing { batch, total_batches }) => {
+                        *status = format!("Syncing batch {}/{}...", batch, total_batches);
+                    }
+                    Ok(ImportProgress::Done(msg)) => {
+                        break Some(Step::Done(format!("Setup complete! {msg}")));
+                    }
+                    Err(_) => break None,
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(step) = next_step {
+            self.step = step;
+        }
     }
 }
 
@@ -275,7 +302,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &mut OnboardingState) {
         Step::SyncMode => render_sync_mode(frame, area, state),
         Step::ProjectSelection => render_project_selection(frame, area, state),
         Step::ImportPrompt => render_import_prompt(frame, area, state),
-        Step::Importing => render_importing(frame, area),
+        Step::Importing { status, .. } => render_importing(frame, area, status),
         Step::Done(msg) => render_done(frame, area, msg),
     }
 }
@@ -445,10 +472,16 @@ fn render_import_prompt(frame: &mut Frame, area: Rect, state: &OnboardingState) 
     frame.render_widget(ratatui::widgets::Paragraph::new(lines), area);
 }
 
-fn render_importing(frame: &mut Frame, area: Rect) {
+fn render_importing(frame: &mut Frame, area: Rect, status: &str) {
+    let spinner = theme::spinner_char();
     let lines = vec![
         Line::from(""),
-        Line::from(Span::styled("  Importing history...", theme::accent_bold())),
+        Line::from(vec![
+            Span::styled(format!("  {spinner} "), theme::accent_bold()),
+            Span::styled("Importing history...", theme::accent_bold()),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(format!("    {status}"), theme::dim())),
     ];
     frame.render_widget(ratatui::widgets::Paragraph::new(lines), area);
 }
