@@ -7,8 +7,8 @@ use serde_json::{json, Value};
 use crate::config::{config_get, DEFAULT_API_BASE};
 use crate::paths::claude_dir;
 use crate::http::http_post;
-use crate::aggregation::parse_iso_flex;
-use crate::transcripts::{discover_sessions, parse_session_transcript, read_cursors, write_cursors};
+use crate::aggregation::{build_payload, Session};
+use crate::transcripts::{discover_sessions, parse_transcript_from_offset, read_cursors, write_cursors};
 
 pub enum ImportProgress {
     Parsing { total_files: usize },
@@ -55,53 +55,45 @@ fn do_import_bg(
 
     let mut total_sessions = 0u32;
     let mut total_prompts = 0u32;
-    let mut all_session_json: Vec<Value> = Vec::new();
+    let mut all_sessions: Vec<Session> = Vec::new();
     let mut cursors = read_cursors(dir);
 
     for (project_name, ph, path) in &discovered {
-        let session = match parse_session_transcript(path, project_name, ph) {
-            Some(s) => s,
-            None => continue,
-        };
+        let (session, new_offset, last_rid, last_out) =
+            match parse_transcript_from_offset(path, 0, "", 0, project_name, ph) {
+                Some(r) => r,
+                None => continue,
+            };
         total_sessions += 1;
         total_prompts += session.prompt_count;
 
-        // Register transcript cursor at end-of-file so incremental sync
-        // picks up only new data appended after this import.
-        let file_size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        // Register cursor with accurate dedup state from the parse
         let path_str = path.to_string_lossy().to_string();
         if !cursors.contains_key(&path_str) {
             cursors.insert(path_str, json!({
-                "byte_offset": file_size,
+                "byte_offset": new_offset,
                 "session_id": session.session_id,
                 "project": session.project,
                 "path_hash": session.path_hash,
-                "last_request_id": "",
-                "last_output_tokens": 0
+                "last_request_id": last_rid,
+                "last_output_tokens": last_out
             }));
         }
 
-        let mut obj = json!({
+        // Write to history-import.jsonl for debug/audit
+        let obj = json!({
             "session_id": session.session_id,
-            "project_hash": session.path_hash,
             "project_name": session.project,
-            "started_at": session.started_at,
-            "ended_at": session.ended_at,
+            "model": session.model,
             "prompt_count": session.prompt_count,
-            "tools": session.tools,
-            "hostname": session.hostname,
+            "total_input_tokens": session.total_input_tokens,
+            "total_output_tokens": session.total_output_tokens,
+            "total_cache_read_tokens": session.total_cache_read_tokens,
+            "total_cache_creation_tokens": session.total_cache_creation_tokens,
         });
-        if !session.permission_mode.is_empty() {
-            obj["permission_mode"] = json!(session.permission_mode);
-        }
-        if let (Some(start), Some(end)) = (
-            parse_iso_flex(&session.started_at),
-            parse_iso_flex(&session.ended_at),
-        ) {
-            obj["duration_seconds"] = json!(end - start);
-        }
         let _ = writeln!(out_file, "{}", serde_json::to_string(&obj).unwrap_or_default());
-        all_session_json.push(obj);
+
+        all_sessions.push(session);
     }
 
     write_cursors(dir, &cursors);
@@ -113,7 +105,7 @@ fn do_import_bg(
     };
     let api_base = DEFAULT_API_BASE;
 
-    let chunks: Vec<&[Value]> = all_session_json.chunks(50).collect();
+    let chunks: Vec<&[Session]> = all_sessions.chunks(50).collect();
     let num_batches = chunks.len();
     let mut total_added = 0u32;
     let mut total_skipped = 0u32;
@@ -121,37 +113,36 @@ fn do_import_bg(
     for (i, chunk) in chunks.iter().enumerate() {
         let _ = tx.send(ImportProgress::Syncing { batch: i + 1, total_batches: num_batches });
 
-        match post_import_batch(api_base, &api_key, chunk) {
-            Ok((added, skipped)) => {
+        match post_sync_batch(api_base, &api_key, chunk) {
+            Ok((added, updated)) => {
                 total_added += added;
-                total_skipped += skipped;
+                total_skipped += updated;
             }
             Err(e) => {
                 return Ok(format!("{parsed_msg} (sync failed: {e})"));
             }
         }
 
-        // Rate limit: 500ms between batches
         if i + 1 < num_batches {
             std::thread::sleep(std::time::Duration::from_millis(500));
         }
     }
 
-    Ok(format!("{parsed_msg} — synced {total_added}, skipped {total_skipped}"))
+    Ok(format!("{parsed_msg} — synced {total_added} new, {total_skipped} updated"))
 }
 
-fn post_import_batch(api_base: &str, api_key: &str, sessions: &[Value]) -> Result<(u32, u32), String> {
-    let payload = json!({ "sessions": sessions });
+fn post_sync_batch(api_base: &str, api_key: &str, sessions: &[Session]) -> Result<(u32, u32), String> {
+    let payload = build_payload(sessions);
     let payload_str = serde_json::to_string(&payload).map_err(|e| format!("{e}"))?;
-    let url = format!("{api_base}/sync/import");
+    let url = format!("{api_base}/sync");
     let (status, body) = http_post(&url, &payload_str, Some(api_key))?;
     if status != 200 {
         return Err(format!("HTTP {status}: {body}"));
     }
     let resp: Value = serde_json::from_str(&body).map_err(|e| format!("Parse error: {e}"))?;
     let added = resp.pointer("/data/added").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-    let skipped = resp.pointer("/data/skipped").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-    Ok((added, skipped))
+    let updated = resp.pointer("/data/updated").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    Ok((added, updated))
 }
 
 pub fn cmd_import(dir: &Path, project_filter: Option<&str>, do_sync: bool) -> i32 {
@@ -193,35 +184,34 @@ pub fn cmd_import(dir: &Path, project_filter: Option<&str>, do_sync: bool) -> i3
     let mut projects: HashSet<String> = HashSet::new();
     let mut earliest = String::new();
     let mut latest = String::new();
-    let mut all_session_json: Vec<Value> = Vec::new();
+    let mut all_sessions: Vec<Session> = Vec::new();
     let mut cursors = read_cursors(dir);
 
     for (i, (project_name, ph, path)) in discovered.iter().enumerate() {
         let file_name = path.file_name().unwrap_or_default().to_string_lossy();
         eprint!("\r  [{}/{}] Parsing {}...", i + 1, discovered.len(), file_name);
 
-        let session = match parse_session_transcript(path, project_name, ph) {
-            Some(s) => s,
-            None => continue,
-        };
+        let (session, new_offset, last_rid, last_out) =
+            match parse_transcript_from_offset(path, 0, "", 0, project_name, ph) {
+                Some(r) => r,
+                None => continue,
+            };
 
         total_sessions += 1;
         total_prompts += session.prompt_count;
         total_tools += session.tools.values().sum::<u32>();
         projects.insert(session.project.clone());
 
-        // Register transcript cursor at end-of-file so incremental sync
-        // picks up only new data appended after this import.
-        let file_size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        // Register cursor with accurate dedup state from the parse
         let path_str = path.to_string_lossy().to_string();
         if !cursors.contains_key(&path_str) {
             cursors.insert(path_str, json!({
-                "byte_offset": file_size,
+                "byte_offset": new_offset,
                 "session_id": session.session_id,
                 "project": session.project,
                 "path_hash": session.path_hash,
-                "last_request_id": "",
-                "last_output_tokens": 0
+                "last_request_id": last_rid,
+                "last_output_tokens": last_out
             }));
         }
 
@@ -234,31 +224,20 @@ pub fn cmd_import(dir: &Path, project_filter: Option<&str>, do_sync: bool) -> i3
             }
         }
 
-        let mut obj = json!({
+        // Write to history-import.jsonl for debug/audit
+        let obj = json!({
             "session_id": session.session_id,
-            "project_hash": session.path_hash,
             "project_name": session.project,
-            "started_at": session.started_at,
-            "ended_at": session.ended_at,
+            "model": session.model,
             "prompt_count": session.prompt_count,
-            "tools": session.tools,
-            "hostname": session.hostname,
+            "total_input_tokens": session.total_input_tokens,
+            "total_output_tokens": session.total_output_tokens,
+            "total_cache_read_tokens": session.total_cache_read_tokens,
+            "total_cache_creation_tokens": session.total_cache_creation_tokens,
         });
+        let _ = writeln!(out_file, "{}", serde_json::to_string(&obj).unwrap_or_default());
 
-        if !session.permission_mode.is_empty() {
-            obj["permission_mode"] = json!(session.permission_mode);
-        }
-
-        if let (Some(start), Some(end)) = (
-            parse_iso_flex(&session.started_at),
-            parse_iso_flex(&session.ended_at),
-        ) {
-            obj["duration_seconds"] = json!(end - start);
-        }
-
-        let line = serde_json::to_string(&obj).unwrap_or_default();
-        let _ = writeln!(out_file, "{}", line);
-        all_session_json.push(obj);
+        all_sessions.push(session);
     }
 
     write_cursors(dir, &cursors);
@@ -287,18 +266,17 @@ pub fn cmd_import(dir: &Path, project_filter: Option<&str>, do_sync: bool) -> i3
 
         eprintln!("\nSyncing history...");
 
-        let batch_size = 50;
-        let mut total_added = 0u32;
-        let mut total_skipped = 0u32;
-        let chunks: Vec<&[Value]> = all_session_json.chunks(batch_size).collect();
+        let chunks: Vec<&[Session]> = all_sessions.chunks(50).collect();
         let num_batches = chunks.len();
+        let mut total_added = 0u32;
+        let mut total_updated = 0u32;
 
         for (batch_idx, chunk) in chunks.iter().enumerate() {
             eprint!("\r  Batch {}/{} ({} sessions)...", batch_idx + 1, num_batches, chunk.len());
-            match post_import_batch(api_base, &api_key, chunk) {
-                Ok((added, skipped)) => {
+            match post_sync_batch(api_base, &api_key, chunk) {
+                Ok((added, updated)) => {
                     total_added += added;
-                    total_skipped += skipped;
+                    total_updated += updated;
                 }
                 Err(e) => {
                     eprintln!("\n  Batch {} failed: {}", batch_idx + 1, e);
@@ -306,7 +284,6 @@ pub fn cmd_import(dir: &Path, project_filter: Option<&str>, do_sync: bool) -> i3
                     return 1;
                 }
             }
-            // Rate limit: 500ms between batches
             if batch_idx + 1 < num_batches {
                 std::thread::sleep(std::time::Duration::from_millis(500));
             }
@@ -315,7 +292,7 @@ pub fn cmd_import(dir: &Path, project_filter: Option<&str>, do_sync: bool) -> i3
         eprintln!("\r                                                  ");
         eprintln!("Sync complete!");
         eprintln!("  Added:   {total_added}");
-        eprintln!("  Skipped: {total_skipped} (already existed)");
+        eprintln!("  Updated: {total_updated}");
     }
 
     0

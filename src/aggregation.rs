@@ -89,14 +89,6 @@ pub fn parse_iso_timestamp(ts: &str) -> Option<i64> {
         .map(|dt| dt.and_utc().timestamp())
 }
 
-/// Parse ISO 8601 timestamp with optional milliseconds
-pub fn parse_iso_flex(ts: &str) -> Option<i64> {
-    chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%S%.fZ")
-        .or_else(|_| chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%SZ"))
-        .ok()
-        .map(|dt| dt.and_utc().timestamp())
-}
-
 pub fn aggregate_file(filepath: &Path) -> Vec<Session> {
     let content = match fs::read_to_string(filepath) {
         Ok(c) => c,
