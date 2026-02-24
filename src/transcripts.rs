@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use serde_json::Value;
 use crate::hash::hash_path;
-use crate::paths::{claude_dir, cursors_path};
+use crate::paths::cursors_path;
 use crate::aggregation::Session;
 
 // ---- Cursor state ----
@@ -35,16 +35,6 @@ pub fn write_cursors(dir: &Path, cursors: &HashMap<String, Value>) {
             let _ = fs::rename(&tmp, &target);
         }
     }
-}
-
-// ---- Transcript path derivation ----
-
-pub fn derive_transcript_path(cwd: &str, session_id: &str) -> PathBuf {
-    let mangled = cwd.replace('/', "-");
-    claude_dir()
-        .join("projects")
-        .join(&mangled)
-        .join(format!("{session_id}.jsonl"))
 }
 
 // ---- Session discovery ----
@@ -318,18 +308,17 @@ pub fn parse_transcript_from_offset(
             Err(_) => break,
         };
         let line_bytes = line.len() as u64 + 1;
+        current_offset += line_bytes;
 
         if line.trim().is_empty() {
-            current_offset += line_bytes;
             continue;
         }
 
         let evt: Value = match serde_json::from_str(&line) {
             Ok(v) => v,
-            Err(_) => break,
+            Err(_) => continue, // skip malformed JSON, keep reading
         };
 
-        current_offset += line_bytes;
         lines_parsed += 1;
 
         let msg_type = evt.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -357,7 +346,12 @@ pub fn parse_transcript_from_offset(
                         session.model = model.to_string();
                     }
                 }
-                let request_id = evt.get("requestId").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let request_id = evt.get("requestId")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| evt.get("uuid").and_then(|v| v.as_str()))
+                    .unwrap_or("unknown")
+                    .to_string();
                 if let Some(usage) = evt.pointer("/message/usage") {
                     let out_tok = usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
                     let entry = usage_map.entry(request_id.clone()).or_insert_with(|| UsageAccum {

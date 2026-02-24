@@ -5,8 +5,8 @@ use chrono::Utc;
 use serde_json::{json, Map, Value};
 use crate::hash::hash_path;
 use crate::paths::metrics_path;
-use crate::sync::{cmd_sync, cmd_sync_transcripts, SYNC_BUFFER_THRESHOLD, SYNC_EVENTS};
-use crate::transcripts::{read_cursors, write_cursors, derive_transcript_path};
+use crate::sync::{cmd_sync, cmd_sync_transcripts, dump_transcript_debug, SYNC_BUFFER_THRESHOLD, SYNC_EVENTS};
+use crate::transcripts::{read_cursors, write_cursors};
 
 fn strip_field_bytes(obj: &mut Map<String, Value>, key: &str) {
     if let Some(val) = obj.remove(key) {
@@ -115,7 +115,8 @@ pub fn cmd_log(dir: &Path) -> i32 {
         obj.insert("tool_response_bytes".to_string(), json!(bytes));
     }
 
-    obj.remove("transcript_path");
+    let transcript_path = obj.remove("transcript_path")
+        .and_then(|v| match v { Value::String(s) if !s.is_empty() => Some(s), _ => None });
 
     if let Some(Value::String(cwd)) = obj.remove("cwd") {
         let ph = hash_path(&cwd);
@@ -127,6 +128,27 @@ pub fn cmd_log(dir: &Path) -> i32 {
         let project_name = cwd.rsplit('/').find(|s| !s.is_empty()).unwrap_or("unknown");
         obj.insert("project".to_string(), json!(project_name));
         obj.insert("_cwd".to_string(), json!(cwd));
+    }
+
+    // Register transcript cursor if not already known
+    if let Some(ref tp) = transcript_path {
+        let sid = obj.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
+        if !sid.is_empty() {
+            let mut cursors = read_cursors(dir);
+            if !cursors.contains_key(tp.as_str()) {
+                let ph = obj.get("path_hash").and_then(|v| v.as_str()).unwrap_or("");
+                let proj = obj.get("project").and_then(|v| v.as_str()).unwrap_or("unknown");
+                cursors.insert(tp.clone(), json!({
+                    "byte_offset": 0,
+                    "session_id": sid,
+                    "project": proj,
+                    "path_hash": ph,
+                    "last_request_id": "",
+                    "last_output_tokens": 0
+                }));
+                write_cursors(dir, &cursors);
+            }
+        }
     }
 
     if event_name == "UserPromptSubmit" {
@@ -157,65 +179,11 @@ pub fn cmd_log(dir: &Path) -> i32 {
     if is_boundary || approx_lines >= SYNC_BUFFER_THRESHOLD {
         cmd_sync(dir);
     }
-
-    0
-}
-
-pub fn cmd_log_transcripts(dir: &Path) -> i32 {
-    let mut input = String::new();
-    if io::stdin().read_to_string(&mut input).is_err() || input.is_empty() {
-        return 0;
-    }
-
-    let evt: Value = match serde_json::from_str(&input) {
-        Ok(v) => v,
-        Err(_) => return 0,
-    };
-
-    let session_id = evt.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
-    let cwd = evt.get("cwd").and_then(|v| v.as_str()).unwrap_or("");
-    let event_name = evt
-        .get("hook_event_name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-
-    if session_id.is_empty() || cwd.is_empty() {
-        return 0;
-    }
-
-    let transcript_path = evt
-        .get("transcript_path")
-        .and_then(|v| v.as_str())
-        .map(|s| std::path::PathBuf::from(s))
-        .unwrap_or_else(|| derive_transcript_path(cwd, session_id));
-
-    let transcript_key = transcript_path.to_string_lossy().to_string();
-
-    let path_hash_val = hash_path(cwd);
-    let project_name = cwd
-        .rsplit('/')
-        .find(|s| !s.is_empty())
-        .unwrap_or("unknown");
-
-    let mut cursors = read_cursors(dir);
-    if !cursors.contains_key(&transcript_key) {
-        cursors.insert(
-            transcript_key,
-            json!({
-                "byte_offset": 0,
-                "session_id": session_id,
-                "project": project_name,
-                "path_hash": path_hash_val,
-                "last_request_id": "",
-                "last_output_tokens": 0
-            }),
-        );
-        write_cursors(dir, &cursors);
-    }
-
-    if SYNC_EVENTS.contains(&event_name) {
+    if is_boundary && crate::config::config_get_bool(dir, "debugMode") {
         cmd_sync_transcripts(dir);
+        dump_transcript_debug(dir);
     }
 
     0
 }
+

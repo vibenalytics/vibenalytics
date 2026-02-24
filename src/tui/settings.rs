@@ -1,15 +1,18 @@
+use std::path::Path;
 use ratatui::prelude::*;
+use ratatui::widgets::{Block, Borders, Paragraph};
 use super::theme;
 
-pub const ACTION_COUNT: usize = 4;
+pub const ACTION_COUNT: usize = 5;
 
 pub struct SettingsState {
     pub selected: usize,
+    pub debug_scroll: u16,
 }
 
 impl Default for SettingsState {
     fn default() -> Self {
-        SettingsState { selected: 0 }
+        SettingsState { selected: 0, debug_scroll: 0 }
     }
 }
 
@@ -22,9 +25,29 @@ impl SettingsState {
             self.selected += 1;
         }
     }
+    pub fn scroll_debug_up(&mut self) {
+        self.debug_scroll = self.debug_scroll.saturating_sub(3);
+    }
+    pub fn scroll_debug_down(&mut self, max_lines: usize, visible: u16) {
+        let max_scroll = (max_lines as u16).saturating_sub(visible);
+        if self.debug_scroll < max_scroll {
+            self.debug_scroll = (self.debug_scroll + 3).min(max_scroll);
+        }
+    }
 }
 
-pub fn render(frame: &mut Frame, area: Rect, state: &SettingsState, user_name: &str, connected: bool, pending_events: usize, default_enabled: bool) {
+pub fn render(
+    frame: &mut Frame,
+    area: Rect,
+    state: &SettingsState,
+    user_name: &str,
+    connected: bool,
+    pending_events: usize,
+    default_enabled: bool,
+    debug_mode: bool,
+    debug_lines: &[String],
+    data_dir: &Path,
+) {
     if !connected {
         let lines = vec![
             Line::from(""),
@@ -36,9 +59,24 @@ pub fn render(frame: &mut Frame, area: Rect, state: &SettingsState, user_name: &
                 Span::styled("Login", theme::accent_bold()),
             ]),
         ];
-        frame.render_widget(ratatui::widgets::Paragraph::new(lines), area);
+        frame.render_widget(Paragraph::new(lines), area);
         return;
     }
+
+    // Split: settings info+actions on top, debug log on bottom (when enabled)
+    let settings_height = if debug_mode { 14u16 } else { 13u16 };
+    let (settings_area, debug_area) = if debug_mode && !debug_lines.is_empty() {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(settings_height),
+                Constraint::Min(3),
+            ])
+            .split(area);
+        (chunks[0], Some(chunks[1]))
+    } else {
+        (area, None)
+    };
 
     let sync_mode = if default_enabled { "auto (all projects)" } else { "manual (whitelist)" };
 
@@ -56,13 +94,21 @@ pub fn render(frame: &mut Frame, area: Rect, state: &SettingsState, user_name: &
             Span::styled("  Pending    ", theme::dim()),
             Span::styled(format!("{pending_events} events"), theme::text()),
         ]),
-        Line::from(""),
     ];
+    if debug_mode {
+        lines.push(Line::from(vec![
+            Span::styled("  Debug dir  ", theme::dim()),
+            Span::styled(data_dir.display().to_string(), theme::warning()),
+        ]));
+    }
+    lines.push(Line::from(""));
 
+    let debug_label = if debug_mode { "Debug Mode: ON" } else { "Debug Mode: OFF" };
     let actions = [
         "Force Sync",
         "Import History",
         if default_enabled { "Switch to manual mode" } else { "Switch to auto mode" },
+        debug_label,
         "Logout",
     ];
 
@@ -88,5 +134,25 @@ pub fn render(frame: &mut Frame, area: Rect, state: &SettingsState, user_name: &
         ]));
     }
 
-    frame.render_widget(ratatui::widgets::Paragraph::new(lines), area);
+    frame.render_widget(Paragraph::new(lines), settings_area);
+
+    // Debug log panel
+    if let Some(log_area) = debug_area {
+        let block = Block::default()
+            .title(Span::styled(" Debug Log ", theme::accent()))
+            .borders(Borders::TOP)
+            .border_style(theme::border());
+
+        let inner = block.inner(log_area);
+
+        let log_lines: Vec<Line> = debug_lines.iter().map(|l| {
+            Line::from(Span::styled(format!("  {l}"), theme::dim()))
+        }).collect();
+
+        let paragraph = Paragraph::new(log_lines)
+            .scroll((state.debug_scroll, 0));
+
+        frame.render_widget(block, log_area);
+        frame.render_widget(paragraph, inner);
+    }
 }

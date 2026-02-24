@@ -78,6 +78,8 @@ ln -sf target/release/vibenalytics ~/.local/bin/vibenalytics-dev
 
 The dev binary (`vibenalytics-dev`) and production binary (`vibenalytics`) use **separate data directories** determined by `APP_NAME` at compile time. They can run side-by-side via the Claude Code plugin system (production plugin from marketplace, dev plugin from local marketplace).
 
+**Always build the dev binary with `APP_NAME=vibenalytics-dev`** so it uses `~/.config/vibenalytics-dev/` for all its data — metrics, settings, sync logs, transcript cursors, and debug dumps. Without this, it falls back to `~/.config/vibenalytics/` and collides with production.
+
 - **Runtime override:** `.sync-config.json` `apiBase` field overrides the compiled `DEFAULT_API_BASE`
 
 ## Data Flow

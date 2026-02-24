@@ -318,12 +318,8 @@ fn main() {
 
         Some(Commands::Update) => update::cmd_update(),
 
-        Some(Commands::Log { use_transcripts }) => {
-            if use_transcripts {
-                log_cmd::cmd_log_transcripts(&dir)
-            } else {
-                log_cmd::cmd_log(&dir)
-            }
+        Some(Commands::Log { .. }) => {
+            log_cmd::cmd_log(&dir)
         }
     };
 

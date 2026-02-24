@@ -40,3 +40,15 @@ pub fn config_get(dir: &Path, key: &str) -> Option<String> {
         .as_str()
         .map(|s| s.to_string())
 }
+
+pub fn config_get_bool(dir: &Path, key: &str) -> bool {
+    read_config(dir)
+        .and_then(|cfg| cfg.get(key)?.as_bool())
+        .unwrap_or(false)
+}
+
+pub fn config_set_bool(dir: &Path, key: &str, value: bool) -> io::Result<()> {
+    let mut cfg = read_config(dir).unwrap_or(serde_json::json!({}));
+    cfg[key] = serde_json::Value::Bool(value);
+    write_config(dir, &cfg)
+}

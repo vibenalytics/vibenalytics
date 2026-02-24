@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 use std::time::SystemTime;
 use chrono::Utc;
@@ -198,15 +199,26 @@ pub fn cmd_sync_transcripts(dir: &Path) -> i32 {
         let fallback_path_hash = cursor_val.get("path_hash").and_then(|v| v.as_str()).unwrap_or("");
 
         let file_size = fs::metadata(transcript_path).map(|m| m.len()).unwrap_or(0);
-        if file_size <= byte_offset {
+        if file_size == 0 || file_size == byte_offset {
             continue;
         }
 
+        // If file shrunk (rotation/truncation), reset cursor to re-parse from start
+        let (parse_offset, parse_prev_rid, parse_prev_out) = if file_size < byte_offset {
+            sync_log(dir, &format!(
+                "[transcripts] File shrunk ({}B < {}B offset), resetting cursor",
+                file_size, byte_offset
+            ));
+            (0u64, "", 0u64)
+        } else {
+            (byte_offset, prev_request_id, prev_output_tokens)
+        };
+
         if let Some((session, new_offset, last_rid, last_out)) = parse_transcript_from_offset(
             transcript_path,
-            byte_offset,
-            prev_request_id,
-            prev_output_tokens,
+            parse_offset,
+            parse_prev_rid,
+            parse_prev_out,
             fallback_project,
             fallback_path_hash,
         ) {
@@ -276,4 +288,118 @@ pub fn cmd_sync_transcripts(dir: &Path) -> i32 {
 
     let _ = fs::remove_file(&lock);
     rc
+}
+
+/// Dry-run transcript aggregation: parses all cursored transcripts and dumps
+/// the results to `transcript-debug/` as timestamped JSON files.
+/// Does NOT advance cursors or sync to server.
+pub fn dump_transcript_debug(dir: &Path) {
+    let cursors = read_cursors(dir);
+    if cursors.is_empty() {
+        return;
+    }
+
+    let debug_dir = dir.join("transcript-debug");
+    let _ = fs::create_dir_all(&debug_dir);
+
+    let mut sessions: Vec<Session> = Vec::new();
+    let mut cursor_snapshots: Vec<serde_json::Value> = Vec::new();
+
+    for (transcript_key, cursor_val) in &cursors {
+        let transcript_path = Path::new(transcript_key.as_str());
+        if !transcript_path.exists() {
+            continue;
+        }
+
+        let byte_offset = cursor_val.get("byte_offset").and_then(|v| v.as_u64()).unwrap_or(0);
+        let prev_request_id = cursor_val.get("last_request_id").and_then(|v| v.as_str()).unwrap_or("");
+        let prev_output_tokens = cursor_val.get("last_output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+        let fallback_project = cursor_val.get("project").and_then(|v| v.as_str()).unwrap_or("unknown");
+        let fallback_path_hash = cursor_val.get("path_hash").and_then(|v| v.as_str()).unwrap_or("");
+
+        let file_size = fs::metadata(transcript_path).map(|m| m.len()).unwrap_or(0);
+
+        cursor_snapshots.push(json!({
+            "transcript": transcript_key,
+            "file_size": file_size,
+            "byte_offset": byte_offset,
+            "prev_request_id": prev_request_id,
+            "prev_output_tokens": prev_output_tokens,
+            "new_bytes": if file_size > byte_offset { file_size - byte_offset } else { 0 },
+        }));
+
+        if file_size == 0 || file_size == byte_offset {
+            continue;
+        }
+
+        let parse_offset = if file_size < byte_offset { 0 } else { byte_offset };
+        let parse_prev_rid = if file_size < byte_offset { "" } else { prev_request_id };
+        let parse_prev_out = if file_size < byte_offset { 0 } else { prev_output_tokens };
+
+        if let Some((session, new_offset, last_rid, last_out)) = parse_transcript_from_offset(
+            transcript_path,
+            parse_offset,
+            parse_prev_rid,
+            parse_prev_out,
+            fallback_project,
+            fallback_path_hash,
+        ) {
+            cursor_snapshots.last_mut().map(|c| {
+                c["parsed_new_offset"] = json!(new_offset);
+                c["parsed_last_rid"] = json!(last_rid);
+                c["parsed_last_out"] = json!(last_out);
+            });
+            sessions.push(session);
+        }
+    }
+
+    let ts = Utc::now().format("%Y%m%d_%H%M%S");
+    let debug_file = debug_dir.join(format!("dump_{ts}.json"));
+
+    let session_data: Vec<serde_json::Value> = sessions.iter().map(|s| {
+        let tool_count: u32 = s.tools.values().sum();
+        json!({
+            "session_id": s.session_id,
+            "project": s.project,
+            "path_hash": s.path_hash,
+            "model": s.model,
+            "started_at": s.started_at,
+            "ended_at": s.ended_at,
+            "message_count": s.message_count,
+            "prompt_count": s.prompt_count,
+            "tool_count": tool_count,
+            "tools": s.tools,
+            "total_input_tokens": s.total_input_tokens,
+            "total_output_tokens": s.total_output_tokens,
+            "total_cache_read_tokens": s.total_cache_read_tokens,
+            "total_cache_creation_tokens": s.total_cache_creation_tokens,
+            "total_turn_duration_ms": s.total_turn_duration_ms,
+            "turn_count": s.turn_count,
+            "hostname": s.hostname,
+            "permission_mode": s.permission_mode,
+        })
+    }).collect();
+
+    let payload = build_payload(&sessions);
+
+    let dump = json!({
+        "dumped_at": Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+        "cursor_count": cursors.len(),
+        "sessions_parsed": sessions.len(),
+        "cursors": cursor_snapshots,
+        "sessions": session_data,
+        "sync_payload": payload,
+    });
+
+    if let Ok(pretty) = serde_json::to_string_pretty(&dump) {
+        if let Ok(mut f) = fs::File::create(&debug_file) {
+            let _ = f.write_all(pretty.as_bytes());
+        }
+    }
+
+    sync_log(dir, &format!(
+        "[transcript-debug] Dumped {} sessions to {}",
+        sessions.len(),
+        debug_file.file_name().unwrap_or_default().to_string_lossy()
+    ));
 }

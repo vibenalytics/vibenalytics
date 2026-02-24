@@ -8,7 +8,7 @@ use crate::config::{config_get, DEFAULT_API_BASE};
 use crate::paths::claude_dir;
 use crate::http::http_post;
 use crate::aggregation::parse_iso_flex;
-use crate::transcripts::{discover_sessions, parse_session_transcript};
+use crate::transcripts::{discover_sessions, parse_session_transcript, read_cursors, write_cursors};
 
 pub enum ImportProgress {
     Parsing { total_files: usize },
@@ -56,6 +56,7 @@ fn do_import_bg(
     let mut total_sessions = 0u32;
     let mut total_prompts = 0u32;
     let mut all_session_json: Vec<Value> = Vec::new();
+    let mut cursors = read_cursors(dir);
 
     for (project_name, ph, path) in &discovered {
         let session = match parse_session_transcript(path, project_name, ph) {
@@ -64,6 +65,21 @@ fn do_import_bg(
         };
         total_sessions += 1;
         total_prompts += session.prompt_count;
+
+        // Register transcript cursor at end-of-file so incremental sync
+        // picks up only new data appended after this import.
+        let file_size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let path_str = path.to_string_lossy().to_string();
+        if !cursors.contains_key(&path_str) {
+            cursors.insert(path_str, json!({
+                "byte_offset": file_size,
+                "session_id": session.session_id,
+                "project": session.project,
+                "path_hash": session.path_hash,
+                "last_request_id": "",
+                "last_output_tokens": 0
+            }));
+        }
 
         let mut obj = json!({
             "session_id": session.session_id,
@@ -88,6 +104,7 @@ fn do_import_bg(
         all_session_json.push(obj);
     }
 
+    write_cursors(dir, &cursors);
     let parsed_msg = format!("Parsed {total_sessions} sessions, {total_prompts} prompts");
 
     let api_key = match config_get(dir, "apiKey") {
@@ -177,6 +194,7 @@ pub fn cmd_import(dir: &Path, project_filter: Option<&str>, do_sync: bool) -> i3
     let mut earliest = String::new();
     let mut latest = String::new();
     let mut all_session_json: Vec<Value> = Vec::new();
+    let mut cursors = read_cursors(dir);
 
     for (i, (project_name, ph, path)) in discovered.iter().enumerate() {
         let file_name = path.file_name().unwrap_or_default().to_string_lossy();
@@ -191,6 +209,21 @@ pub fn cmd_import(dir: &Path, project_filter: Option<&str>, do_sync: bool) -> i3
         total_prompts += session.prompt_count;
         total_tools += session.tools.values().sum::<u32>();
         projects.insert(session.project.clone());
+
+        // Register transcript cursor at end-of-file so incremental sync
+        // picks up only new data appended after this import.
+        let file_size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let path_str = path.to_string_lossy().to_string();
+        if !cursors.contains_key(&path_str) {
+            cursors.insert(path_str, json!({
+                "byte_offset": file_size,
+                "session_id": session.session_id,
+                "project": session.project,
+                "path_hash": session.path_hash,
+                "last_request_id": "",
+                "last_output_tokens": 0
+            }));
+        }
 
         if !session.started_at.is_empty() {
             if earliest.is_empty() || session.started_at < earliest {
@@ -227,6 +260,8 @@ pub fn cmd_import(dir: &Path, project_filter: Option<&str>, do_sync: bool) -> i3
         let _ = writeln!(out_file, "{}", line);
         all_session_json.push(obj);
     }
+
+    write_cursors(dir, &cursors);
 
     eprintln!("\r                                                              ");
 

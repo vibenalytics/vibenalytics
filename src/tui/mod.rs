@@ -19,7 +19,7 @@ use crossterm::{
 };
 use ratatui::prelude::*;
 
-use crate::config::config_get;
+use crate::config::{config_get, config_get_bool, config_set_bool};
 use crate::paths::metrics_path;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -73,6 +73,9 @@ struct App {
     login_state: Option<crate::auth::LoginListener>,
     import_picker: Option<import_picker::ImportPickerState>,
     onboarding: Option<onboarding::OnboardingState>,
+    debug_mode: bool,
+    debug_log: Vec<String>,
+    last_debug_reload: Instant,
 }
 
 impl App {
@@ -105,6 +108,8 @@ impl App {
             None
         };
 
+        let debug_mode = config_get_bool(dir, "debugMode");
+
         App {
             dir: dir.to_path_buf(),
             tab: Tab::Dashboard,
@@ -119,6 +124,9 @@ impl App {
             login_state: None,
             import_picker: None,
             onboarding,
+            debug_mode,
+            debug_log: Vec::new(),
+            last_debug_reload: Instant::now(),
         }
     }
 
@@ -129,6 +137,57 @@ impl App {
             .map(|c| c.lines().filter(|l| !l.trim().is_empty()).count())
             .unwrap_or(0);
         self.projects_state.load(&self.dir);
+        self.debug_mode = config_get_bool(&self.dir, "debugMode");
+    }
+
+    fn load_debug_log(&mut self) {
+        let mut lines = Vec::new();
+
+        // sync.log tail
+        let log_path = self.dir.join("sync.log");
+        if let Ok(content) = std::fs::read_to_string(&log_path) {
+            lines.push("--- sync.log (last 30 lines) ---".to_string());
+            let all: Vec<&str> = content.lines().collect();
+            let start = all.len().saturating_sub(30);
+            for l in &all[start..] {
+                lines.push(l.to_string());
+            }
+        }
+
+        // Latest transcript debug dump
+        let debug_dir = self.dir.join("transcript-debug");
+        if let Ok(entries) = std::fs::read_dir(&debug_dir) {
+            let mut files: Vec<_> = entries
+                .flatten()
+                .filter(|e| e.path().extension().map(|x| x == "json").unwrap_or(false))
+                .collect();
+            files.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+            if let Some(latest) = files.first() {
+                lines.push(String::new());
+                lines.push(format!("--- {} ---", latest.file_name().to_string_lossy()));
+                if let Ok(content) = std::fs::read_to_string(latest.path()) {
+                    for l in content.lines().take(60) {
+                        lines.push(l.to_string());
+                    }
+                    let total = content.lines().count();
+                    if total > 60 {
+                        lines.push(format!("... ({} more lines)", total - 60));
+                    }
+                }
+            }
+        }
+
+        // Cursor state
+        let cursors_path = self.dir.join("transcript-cursors.json");
+        if let Ok(content) = std::fs::read_to_string(&cursors_path) {
+            lines.push(String::new());
+            lines.push("--- transcript-cursors.json ---".to_string());
+            for l in content.lines().take(30) {
+                lines.push(l.to_string());
+            }
+        }
+
+        self.debug_log = lines;
     }
 
     fn handle_key(&mut self, key: KeyCode) {
@@ -270,6 +329,17 @@ impl App {
                     self.projects_state.toggle();
                 }
             }
+            KeyCode::PageUp => {
+                if self.tab == Tab::Settings && self.debug_mode {
+                    self.settings_state.scroll_debug_up();
+                }
+            }
+            KeyCode::PageDown => {
+                if self.tab == Tab::Settings && self.debug_mode {
+                    let visible = 10; // approximate visible lines
+                    self.settings_state.scroll_debug_down(self.debug_log.len(), visible);
+                }
+            }
             KeyCode::Enter => {
                 match self.tab {
                     Tab::Settings => {
@@ -344,6 +414,20 @@ impl App {
                 }
             }
             3 => {
+                let new_val = !self.debug_mode;
+                if let Ok(()) = config_set_bool(&self.dir, "debugMode", new_val) {
+                    self.debug_mode = new_val;
+                    if new_val {
+                        self.load_debug_log();
+                        self.settings_state.debug_scroll = 0;
+                        self.status_msg = "Debug mode enabled".into();
+                    } else {
+                        self.debug_log.clear();
+                        self.status_msg = "Debug mode disabled".into();
+                    }
+                }
+            }
+            4 => {
                 crate::auth::cmd_logout(&self.dir);
                 self.status_msg = "Logged out".into();
                 self.reload();
@@ -438,6 +522,14 @@ pub fn run(dir: &Path) -> i32 {
 
         app.poll_login();
         app.poll_import();
+
+        // Reload debug log periodically when viewing settings with debug on
+        if app.debug_mode && app.tab == Tab::Settings
+            && app.last_debug_reload.elapsed() >= Duration::from_secs(2)
+        {
+            app.load_debug_log();
+            app.last_debug_reload = Instant::now();
+        }
 
         let _ = terminal.draw(|frame| {
             let size = frame.area();
@@ -572,7 +664,7 @@ pub fn run(dir: &Path) -> i32 {
                 Tab::Dashboard => dashboard::render(frame, layout[2]),
                 Tab::Sessions => sessions::render(frame, layout[2], &app.sessions_state),
                 Tab::Projects => projects::render(frame, layout[2], &mut app.projects_state),
-                Tab::Settings => settings::render(frame, layout[2], &app.settings_state, &app.user_name, app.connected, app.pending_events, app.projects_state.registry.default_enabled),
+                Tab::Settings => settings::render(frame, layout[2], &app.settings_state, &app.user_name, app.connected, app.pending_events, app.projects_state.registry.default_enabled, app.debug_mode, &app.debug_log, &app.dir),
             }
 
             if has_status {
@@ -593,7 +685,11 @@ pub fn run(dir: &Path) -> i32 {
                     } else {
                         "↑/↓ navigate  space toggle  ←/→ tabs  esc quit"
                     },
-                    Tab::Settings => "↑/↓ select  enter run  ←/→ tabs  esc quit",
+                    Tab::Settings => if app.debug_mode {
+                        "↑/↓ select  enter run  PgUp/PgDn scroll log  ←/→ tabs  esc quit"
+                    } else {
+                        "↑/↓ select  enter run  ←/→ tabs  esc quit"
+                    },
                 }
             };
             header::render_footer(frame, layout[4], hints);
