@@ -52,3 +52,9 @@ pub fn config_set_bool(dir: &Path, key: &str, value: bool) -> io::Result<()> {
     cfg[key] = serde_json::Value::Bool(value);
     write_config(dir, &cfg)
 }
+
+pub fn config_set(dir: &Path, key: &str, value: &str) -> io::Result<()> {
+    let mut cfg = read_config(dir).unwrap_or(serde_json::json!({}));
+    cfg[key] = serde_json::Value::String(value.to_string());
+    write_config(dir, &cfg)
+}

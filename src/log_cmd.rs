@@ -176,11 +176,19 @@ pub fn cmd_log(dir: &Path) -> i32 {
         event_name, tool_name, session_short, is_boundary, approx_lines
     ));
 
-    if is_boundary || approx_lines >= SYNC_BUFFER_THRESHOLD {
-        cmd_sync(dir);
+    let use_transcripts = crate::config::config_get(dir, "syncSource")
+        .map(|s| s == "transcripts").unwrap_or(false);
+
+    if use_transcripts {
+        if is_boundary {
+            cmd_sync_transcripts(dir);
+        }
+    } else {
+        if is_boundary || approx_lines >= SYNC_BUFFER_THRESHOLD {
+            cmd_sync(dir);
+        }
     }
     if is_boundary && crate::config::config_get_bool(dir, "debugMode") {
-        cmd_sync_transcripts(dir);
         dump_transcript_debug(dir);
     }
 
