@@ -8,7 +8,7 @@ use crate::config::{config_get, DEFAULT_API_BASE};
 use crate::paths::claude_dir;
 use crate::http::http_post;
 use crate::aggregation::{build_payload, Session};
-use crate::transcripts::{discover_sessions, parse_transcript_from_offset, read_cursors, write_cursors};
+use crate::transcripts::{discover_sessions, parse_transcript_from_offset, find_subagent_files, merge_subagent_sessions, read_cursors, write_cursors};
 
 pub enum ImportProgress {
     Parsing { total_files: usize },
@@ -43,11 +43,15 @@ fn do_import_bg(
     }
 
     let discovered = discover_sessions(&claude, Some(selected_dirs));
-    if discovered.is_empty() {
+    // Filter to parent sessions only (subagents are merged into parents)
+    let parent_sessions: Vec<_> = discovered.iter()
+        .filter(|(_, _, _, is_sub, _)| !*is_sub)
+        .collect();
+    if parent_sessions.is_empty() {
         return Err("No session files found in ~/.claude/projects/".to_string());
     }
 
-    let _ = tx.send(ImportProgress::Parsing { total_files: discovered.len() });
+    let _ = tx.send(ImportProgress::Parsing { total_files: parent_sessions.len() });
 
     let output_path = dir.join("history-import.jsonl");
     let mut out_file = fs::File::create(&output_path)
@@ -58,12 +62,35 @@ fn do_import_bg(
     let mut all_sessions: Vec<Session> = Vec::new();
     let mut cursors = read_cursors(dir);
 
-    for (project_name, ph, path) in &discovered {
-        let (session, new_offset, last_rid, last_out) =
-            match parse_transcript_from_offset(path, 0, "", 0, project_name, ph) {
+    for (project_name, ph, path, _, _) in &parent_sessions {
+        let (mut session, new_offset, last_rid, last_mid, last_out) =
+            match parse_transcript_from_offset(path, 0, "", "", 0, project_name, ph) {
                 Some(r) => r,
                 None => continue,
             };
+
+        // Discover and merge subagent files
+        let subagent_files = find_subagent_files(path);
+        for sub_path in &subagent_files {
+            if let Some((sub_session, sub_offset, sub_rid, sub_mid, sub_out)) =
+                parse_transcript_from_offset(sub_path, 0, "", "", 0, project_name, ph)
+            {
+                merge_subagent_sessions(&mut session, sub_session);
+                let sub_key = sub_path.to_string_lossy().to_string();
+                if !cursors.contains_key(&sub_key) {
+                    cursors.insert(sub_key, json!({
+                        "byte_offset": sub_offset,
+                        "session_id": session.session_id,
+                        "project": session.project,
+                        "path_hash": session.path_hash,
+                        "last_request_id": sub_rid,
+                        "last_message_id": sub_mid,
+                        "last_output_tokens": sub_out
+                    }));
+                }
+            }
+        }
+
         total_sessions += 1;
         total_prompts += session.prompt_count;
 
@@ -76,6 +103,7 @@ fn do_import_bg(
                 "project": session.project,
                 "path_hash": session.path_hash,
                 "last_request_id": last_rid,
+                "last_message_id": last_mid,
                 "last_output_tokens": last_out
             }));
         }
@@ -153,21 +181,25 @@ pub fn cmd_import(dir: &Path, project_filter: Option<&str>, do_sync: bool) -> i3
     }
 
     eprintln!("Scanning {}...", claude.join("projects").display());
-    let mut discovered = discover_sessions(&claude, None);
+    let discovered = discover_sessions(&claude, None);
+    // Filter to parent sessions only
+    let mut parent_sessions: Vec<_> = discovered.into_iter()
+        .filter(|(_, _, _, is_sub, _)| !*is_sub)
+        .collect();
 
     if let Some(filter) = project_filter {
         let filter_lower = filter.to_lowercase();
-        let before = discovered.len();
-        discovered.retain(|(name, _, _)| name.to_lowercase().contains(&filter_lower));
-        eprintln!("Filter '{}': {} of {} session files match", filter, discovered.len(), before);
+        let before = parent_sessions.len();
+        parent_sessions.retain(|(name, _, _, _, _)| name.to_lowercase().contains(&filter_lower));
+        eprintln!("Filter '{}': {} of {} session files match", filter, parent_sessions.len(), before);
     }
 
-    if discovered.is_empty() {
+    if parent_sessions.is_empty() {
         eprintln!("No session files found.");
         return 1;
     }
 
-    eprintln!("Found {} session files. Parsing...", discovered.len());
+    eprintln!("Found {} session files. Parsing...", parent_sessions.len());
 
     let output_path = dir.join("history-import.jsonl");
     let mut out_file = match fs::File::create(&output_path) {
@@ -187,15 +219,37 @@ pub fn cmd_import(dir: &Path, project_filter: Option<&str>, do_sync: bool) -> i3
     let mut all_sessions: Vec<Session> = Vec::new();
     let mut cursors = read_cursors(dir);
 
-    for (i, (project_name, ph, path)) in discovered.iter().enumerate() {
+    for (i, (project_name, ph, path, _, _)) in parent_sessions.iter().enumerate() {
         let file_name = path.file_name().unwrap_or_default().to_string_lossy();
-        eprint!("\r  [{}/{}] Parsing {}...", i + 1, discovered.len(), file_name);
+        eprint!("\r  [{}/{}] Parsing {}...", i + 1, parent_sessions.len(), file_name);
 
-        let (session, new_offset, last_rid, last_out) =
-            match parse_transcript_from_offset(path, 0, "", 0, project_name, ph) {
+        let (mut session, new_offset, last_rid, last_mid, last_out) =
+            match parse_transcript_from_offset(path, 0, "", "", 0, project_name, ph) {
                 Some(r) => r,
                 None => continue,
             };
+
+        // Discover and merge subagent files
+        let subagent_files = find_subagent_files(path);
+        for sub_path in &subagent_files {
+            if let Some((sub_session, sub_offset, sub_rid, sub_mid, sub_out)) =
+                parse_transcript_from_offset(sub_path, 0, "", "", 0, project_name, ph)
+            {
+                merge_subagent_sessions(&mut session, sub_session);
+                let sub_key = sub_path.to_string_lossy().to_string();
+                if !cursors.contains_key(&sub_key) {
+                    cursors.insert(sub_key, json!({
+                        "byte_offset": sub_offset,
+                        "session_id": session.session_id,
+                        "project": session.project,
+                        "path_hash": session.path_hash,
+                        "last_request_id": sub_rid,
+                        "last_message_id": sub_mid,
+                        "last_output_tokens": sub_out
+                    }));
+                }
+            }
+        }
 
         total_sessions += 1;
         total_prompts += session.prompt_count;
@@ -211,6 +265,7 @@ pub fn cmd_import(dir: &Path, project_filter: Option<&str>, do_sync: bool) -> i3
                 "project": session.project,
                 "path_hash": session.path_hash,
                 "last_request_id": last_rid,
+                "last_message_id": last_mid,
                 "last_output_tokens": last_out
             }));
         }
@@ -253,6 +308,17 @@ pub fn cmd_import(dir: &Path, project_filter: Option<&str>, do_sync: bool) -> i3
         eprintln!("  Range:     {} .. {}", &earliest[..10.min(earliest.len())], &latest[..10.min(latest.len())]);
     }
     eprintln!("  Output:    {}", output_path.display());
+
+    if !do_sync {
+        // Dry mode: write the exact sync payload that would be POSTed
+        let payload = build_payload(&all_sessions);
+        let payload_path = dir.join("dry-run-payload.json");
+        if let Ok(pretty) = serde_json::to_string_pretty(&payload) {
+            if fs::write(&payload_path, &pretty).is_ok() {
+                eprintln!("  Payload:   {}", payload_path.display());
+            }
+        }
+    }
 
     if do_sync {
         let api_key = match config_get(dir, "apiKey") {

@@ -78,6 +78,13 @@ enum Commands {
         /// Force sync even if recently synced
         #[arg(long)]
         force: bool,
+
+        /// Preview what would be synced without advancing cursors
+        #[arg(long)]
+        dry: bool,
+
+        /// Filter by project name (substring match)
+        project: Option<String>,
     },
 
     /// Import session history from ~/.claude/
@@ -88,6 +95,12 @@ enum Commands {
         /// Parse only, skip backend sync
         #[arg(long)]
         dry: bool,
+    },
+
+    /// View or change settings
+    Settings {
+        #[command(subcommand)]
+        action: Option<SettingsAction>,
     },
 
     /// Update to the latest version
@@ -131,6 +144,32 @@ enum ProjectAction {
         name: Option<String>,
     },
 }
+
+#[derive(Subcommand)]
+enum SettingsAction {
+    /// Show all settings
+    List,
+
+    /// Get a setting value
+    Get {
+        /// Setting key
+        key: String,
+    },
+
+    /// Set a setting value
+    Set {
+        /// Setting key
+        key: String,
+        /// Setting value (true/false for booleans)
+        value: String,
+    },
+}
+
+const SETTINGS_HELP: &[(&str, &str, &str)] = &[
+    ("autoSync", "bool", "Auto-sync on boundary events (default: true)"),
+    ("syncSource", "string", "Sync source: 'transcripts' or 'hook' (default: transcripts)"),
+    ("debugMode", "bool", "Write debug transcript dumps (default: false)"),
+];
 
 fn resolve_name_or_cwd(name: Option<String>) -> String {
     name.unwrap_or_else(|| {
@@ -213,6 +252,75 @@ fn cmd_project_list(dir: &std::path::Path, json_output: bool) -> i32 {
         println!("  {:<16} {:<10} {}", p.name, status, p.path);
     }
     0
+}
+
+fn cmd_settings(dir: &std::path::Path, action: Option<SettingsAction>) -> i32 {
+    match action {
+        None | Some(SettingsAction::List) => {
+            println!("  {:<16} {:<8} {}", "KEY", "VALUE", "DESCRIPTION");
+            for &(key, kind, desc) in SETTINGS_HELP {
+                let val = match kind {
+                    "bool" => {
+                        let default = key == "autoSync"; // only autoSync defaults to true
+                        let v = config::config_get_bool_default(dir, key, default);
+                        if v { "true" } else { "false" }.to_string()
+                    }
+                    _ => config::config_get(dir, key).unwrap_or("-".to_string()),
+                };
+                println!("  {:<16} {:<8} {}", key, val, desc);
+            }
+            0
+        }
+        Some(SettingsAction::Get { key }) => {
+            let known = SETTINGS_HELP.iter().find(|&&(k, _, _)| k == key);
+            if let Some(&(_, kind, _)) = known {
+                let val = match kind {
+                    "bool" => {
+                        let default = key == "autoSync";
+                        let v = config::config_get_bool_default(dir, &key, default);
+                        if v { "true" } else { "false" }.to_string()
+                    }
+                    _ => config::config_get(dir, &key).unwrap_or("-".to_string()),
+                };
+                println!("{}", val);
+            } else {
+                // Allow reading arbitrary keys
+                match config::config_get(dir, &key) {
+                    Some(v) => println!("{}", v),
+                    None => println!("-"),
+                }
+            }
+            0
+        }
+        Some(SettingsAction::Set { key, value }) => {
+            let known = SETTINGS_HELP.iter().find(|&&(k, _, _)| k == key);
+            match known.map(|&(_, kind, _)| kind) {
+                Some("bool") => {
+                    let b = match value.as_str() {
+                        "true" | "on" | "1" | "yes" => true,
+                        "false" | "off" | "0" | "no" => false,
+                        _ => {
+                            eprintln!("Invalid boolean: {}. Use true/false, on/off, 1/0", value);
+                            return 1;
+                        }
+                    };
+                    if let Err(e) = config::config_set_bool(dir, &key, b) {
+                        eprintln!("Failed to write config: {e}");
+                        return 1;
+                    }
+                    println!("{} = {}", key, b);
+                }
+                _ => {
+                    if let Err(e) = config::config_set(dir, &key, &value) {
+                        eprintln!("Failed to write config: {e}");
+                        return 1;
+                    }
+                    println!("{} = {}", key, value);
+                }
+            }
+            0
+        }
+    }
 }
 
 fn main() {
@@ -304,8 +412,17 @@ fn main() {
             }
         },
 
+        Some(Commands::Settings { action }) => cmd_settings(&dir, action),
+
+        Some(Commands::Sync { dry: true, project, .. }) => {
+            sync::cmd_sync_dry(&dir, project.as_deref())
+        }
+
         Some(Commands::Sync { use_transcripts, .. }) => {
-            if use_transcripts {
+            // Default is now transcripts unless explicitly using hooks
+            let use_hooks_config = config::config_get(&dir, "syncSource")
+                .map(|s| s == "hook").unwrap_or(false);
+            if use_transcripts || !use_hooks_config {
                 sync::cmd_sync_transcripts(&dir)
             } else {
                 sync::cmd_sync(&dir)

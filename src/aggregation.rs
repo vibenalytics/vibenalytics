@@ -3,6 +3,18 @@ use std::fs;
 use std::path::Path;
 use serde_json::{json, Value};
 
+pub struct RequestUsage {
+    pub request_id: String,
+    pub message_id: String,
+    pub timestamp: String,
+    pub model: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub is_subagent: bool,
+}
+
 pub struct ToolLatency {
     pub tool: String,
     pub total_ms: u64,
@@ -29,8 +41,6 @@ pub struct Session {
     pub tools: HashMap<String, u32>,
     pub prompt_count: u32,
     pub message_count: u32,
-    pub total_input_bytes: u64,
-    pub total_response_bytes: u64,
     pub tool_latencies: Vec<ToolLatency>,
     pub permission_requests: Vec<PermissionStat>,
     pub tool_response_sizes: HashMap<String, (u64, u32)>,
@@ -43,6 +53,8 @@ pub struct Session {
     pub total_turn_duration_ms: u64,
     pub turn_count: u32,
     pub model: String,
+    pub claude_version: String,
+    pub requests: Vec<RequestUsage>,
 }
 
 impl crate::projects::HasProjectHash for Session {
@@ -65,8 +77,6 @@ impl Session {
             tools: HashMap::new(),
             prompt_count: 0,
             message_count: 0,
-            total_input_bytes: 0,
-            total_response_bytes: 0,
             tool_latencies: Vec::new(),
             permission_requests: Vec::new(),
             tool_response_sizes: HashMap::new(),
@@ -79,6 +89,8 @@ impl Session {
             total_turn_duration_ms: 0,
             turn_count: 0,
             model: String::new(),
+            claude_version: String::new(),
+            requests: Vec::new(),
         }
     }
 }
@@ -264,13 +276,6 @@ pub fn aggregate_file(filepath: &Path) -> Vec<Session> {
             s.prompt_count += 1;
         }
 
-        if let Some(ib) = evt.get("_input_bytes").and_then(|v| v.as_u64()) {
-            s.total_input_bytes += ib;
-        }
-        if let Some(rb) = evt.get("tool_response_bytes").and_then(|v| v.as_u64()) {
-            s.total_response_bytes += rb;
-        }
-
         if let Some(pm) = evt.get("permission_mode").and_then(|v| v.as_str()) {
             s.permission_mode = pm.to_string();
         }
@@ -292,8 +297,7 @@ pub fn build_payload(sessions: &[Session]) -> Value {
                 "events": s.events,
                 "tools": s.tools,
                 "prompt_count": s.prompt_count,
-                "total_input_bytes": s.total_input_bytes,
-                "total_response_bytes": s.total_response_bytes,
+                "message_count": s.message_count,
             });
             if !s.permission_mode.is_empty() {
                 obj["permission_mode"] = json!(s.permission_mode);
@@ -348,6 +352,28 @@ pub fn build_payload(sessions: &[Session]) -> Value {
             }
             if !s.model.is_empty() {
                 obj["model"] = json!(s.model);
+            }
+            if !s.claude_version.is_empty() {
+                obj["claude_version"] = json!(s.claude_version);
+            }
+            if !s.requests.is_empty() {
+                obj["requests"] = json!(s.requests.iter().map(|r| json!({
+                    "request_id": r.request_id,
+                    "message_id": r.message_id,
+                    "timestamp": r.timestamp,
+                    "model": r.model,
+                    "input_tokens": r.input_tokens,
+                    "output_tokens": r.output_tokens,
+                    "cache_read_tokens": r.cache_read_tokens,
+                    "cache_creation_tokens": r.cache_creation_tokens,
+                    "is_subagent": r.is_subagent,
+                })).collect::<Vec<_>>());
+            }
+            if s.requests.iter().any(|r| r.is_subagent) {
+                let sub_in: u64 = s.requests.iter().filter(|r| r.is_subagent).map(|r| r.input_tokens).sum();
+                let sub_out: u64 = s.requests.iter().filter(|r| r.is_subagent).map(|r| r.output_tokens).sum();
+                obj["subagent_input_tokens"] = json!(sub_in);
+                obj["subagent_output_tokens"] = json!(sub_out);
             }
             obj
         })

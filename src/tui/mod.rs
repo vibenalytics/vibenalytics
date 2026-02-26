@@ -19,7 +19,7 @@ use crossterm::{
 };
 use ratatui::prelude::*;
 
-use crate::config::{config_get, config_get_bool, config_set, config_set_bool};
+use crate::config::{config_get, config_get_bool, config_get_bool_default, config_set, config_set_bool};
 use crate::paths::metrics_path;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -74,6 +74,7 @@ struct App {
     import_picker: Option<import_picker::ImportPickerState>,
     onboarding: Option<onboarding::OnboardingState>,
     use_transcripts: bool,
+    auto_sync: bool,
     debug_mode: bool,
     debug_log: Vec<String>,
     last_debug_reload: Instant,
@@ -111,6 +112,7 @@ impl App {
 
         let use_transcripts = config_get(dir, "syncSource")
             .map(|s| s == "transcripts").unwrap_or(false);
+        let auto_sync = config_get_bool_default(dir, "autoSync", true);
         let debug_mode = config_get_bool(dir, "debugMode");
 
         App {
@@ -128,6 +130,7 @@ impl App {
             import_picker: None,
             onboarding,
             use_transcripts,
+            auto_sync,
             debug_mode,
             debug_log: Vec::new(),
             last_debug_reload: Instant::now(),
@@ -143,6 +146,7 @@ impl App {
         self.projects_state.load(&self.dir);
         self.use_transcripts = config_get(&self.dir, "syncSource")
             .map(|s| s == "transcripts").unwrap_or(false);
+        self.auto_sync = config_get_bool_default(&self.dir, "autoSync", true);
         self.debug_mode = config_get_bool(&self.dir, "debugMode");
     }
 
@@ -406,6 +410,14 @@ impl App {
                 }
             }
             2 => {
+                let new_val = !self.auto_sync;
+                if let Ok(()) = config_set_bool(&self.dir, "autoSync", new_val) {
+                    self.auto_sync = new_val;
+                    let label = if new_val { "enabled" } else { "disabled" };
+                    self.status_msg = format!("Auto sync {label}");
+                }
+            }
+            3 => {
                 let mut registry = crate::projects::read_projects(&self.dir);
                 registry.default_enabled = !registry.default_enabled;
                 match crate::projects::write_projects(&self.dir, &registry) {
@@ -419,7 +431,7 @@ impl App {
                     }
                 }
             }
-            3 => {
+            4 => {
                 let new_source = if self.use_transcripts { "hooks" } else { "transcripts" };
                 if let Ok(()) = config_set(&self.dir, "syncSource", new_source) {
                     self.use_transcripts = !self.use_transcripts;
@@ -427,7 +439,7 @@ impl App {
                     self.reload();
                 }
             }
-            4 => {
+            5 => {
                 let new_val = !self.debug_mode;
                 if let Ok(()) = config_set_bool(&self.dir, "debugMode", new_val) {
                     self.debug_mode = new_val;
@@ -441,7 +453,7 @@ impl App {
                     }
                 }
             }
-            5 => {
+            6 => {
                 crate::auth::cmd_logout(&self.dir);
                 self.status_msg = "Logged out".into();
                 self.reload();
@@ -678,7 +690,7 @@ pub fn run(dir: &Path) -> i32 {
                 Tab::Dashboard => dashboard::render(frame, layout[2]),
                 Tab::Sessions => sessions::render(frame, layout[2], &app.sessions_state),
                 Tab::Projects => projects::render(frame, layout[2], &mut app.projects_state),
-                Tab::Settings => settings::render(frame, layout[2], &app.settings_state, &app.user_name, app.connected, app.pending_events, app.projects_state.registry.default_enabled, app.use_transcripts, app.debug_mode, &app.debug_log, &app.dir),
+                Tab::Settings => settings::render(frame, layout[2], &app.settings_state, &app.user_name, app.connected, app.pending_events, app.projects_state.registry.default_enabled, app.use_transcripts, app.auto_sync, app.debug_mode, &app.debug_log, &app.dir),
             }
 
             if has_status {

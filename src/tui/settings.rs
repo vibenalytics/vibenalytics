@@ -3,7 +3,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
 use super::theme;
 
-pub const ACTION_COUNT: usize = 6;
+pub const ACTION_COUNT: usize = 7;
 
 pub struct SettingsState {
     pub selected: usize,
@@ -45,6 +45,7 @@ pub fn render(
     pending_events: usize,
     default_enabled: bool,
     use_transcripts: bool,
+    auto_sync: bool,
     debug_mode: bool,
     debug_lines: &[String],
     data_dir: &Path,
@@ -65,7 +66,7 @@ pub fn render(
     }
 
     // Split: settings info+actions on top, debug log on bottom (when enabled)
-    let settings_height = if debug_mode { 16u16 } else { 15u16 };
+    let settings_height = if debug_mode { 18u16 } else { 17u16 };
     let (settings_area, debug_area) = if debug_mode && !debug_lines.is_empty() {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -89,6 +90,10 @@ pub fn render(
             Span::styled(format!("● {user_name}"), theme::success()),
         ]),
         Line::from(vec![
+            Span::styled("  Auto sync    ", theme::dim()),
+            Span::styled(if auto_sync { "on" } else { "off" }, if auto_sync { theme::success() } else { theme::warning() }),
+        ]),
+        Line::from(vec![
             Span::styled("  Sync mode    ", theme::dim()),
             Span::styled(sync_mode, theme::text()),
         ]),
@@ -109,11 +114,13 @@ pub fn render(
     }
     lines.push(Line::from(""));
 
+    let auto_sync_label = if auto_sync { "Disable auto sync" } else { "Enable auto sync" };
     let data_source_label = if use_transcripts { "Switch to hooks" } else { "Switch to transcripts" };
     let debug_label = if debug_mode { "Debug Mode: ON" } else { "Debug Mode: OFF" };
     let actions = [
         "Force Sync",
         "Import History",
+        auto_sync_label,
         if default_enabled { "Switch to manual mode" } else { "Switch to auto mode" },
         data_source_label,
         debug_label,

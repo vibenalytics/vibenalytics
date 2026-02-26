@@ -4,13 +4,32 @@ use std::path::Path;
 use std::time::SystemTime;
 use chrono::Utc;
 use serde_json::json;
-use crate::config::{config_get, DEFAULT_API_BASE};
+use crate::config::{config_get, config_get_bool, DEFAULT_API_BASE};
 use crate::paths::{metrics_path, cursors_path, sync_log};
 use crate::http::http_post;
 use crate::aggregation::{aggregate_file, build_payload, Session};
-use crate::transcripts::{read_cursors, write_cursors, parse_transcript_from_offset};
+use crate::transcripts::{read_cursors, write_cursors, parse_transcript_from_offset, find_subagent_files, merge_subagent_sessions};
 
-pub const SYNC_BUFFER_THRESHOLD: usize = 10;
+/// If debugMode is enabled, write the raw sync payload to `sync-debug/` as a timestamped JSON file.
+fn dump_sync_payload(dir: &Path, label: &str, payload: &serde_json::Value) {
+    if !config_get_bool(dir, "debugMode") {
+        return;
+    }
+    let debug_dir = dir.join("sync-debug");
+    let _ = fs::create_dir_all(&debug_dir);
+    let ts = Utc::now().format("%Y%m%d_%H%M%S");
+    let debug_file = debug_dir.join(format!("{label}_{ts}.json"));
+    if let Ok(pretty) = serde_json::to_string_pretty(payload) {
+        if let Ok(mut f) = fs::File::create(&debug_file) {
+            let _ = f.write_all(pretty.as_bytes());
+        }
+    }
+    sync_log(dir, &format!(
+        "[debug] Dumped {label} payload to {}",
+        debug_file.file_name().unwrap_or_default().to_string_lossy()
+    ));
+}
+
 pub const SYNC_EVENTS: &[&str] = &["SessionStart", "SessionEnd", "Stop", "UserPromptSubmit"];
 
 pub fn cmd_sync(dir: &Path) -> i32 {
@@ -92,15 +111,15 @@ pub fn cmd_sync(dir: &Path) -> i32 {
     for s in &sessions {
         let tool_count: u32 = s.tools.values().sum();
         sync_log(dir, &format!(
-            "  session={} project={} prompts={} tools={} events={} input_bytes={} response_bytes={}",
+            "  session={} project={} prompts={} tools={} events={}",
             &s.session_id[..s.session_id.len().min(12)],
             s.project, s.prompt_count, tool_count,
-            s.events.values().sum::<u32>(),
-            s.total_input_bytes, s.total_response_bytes
+            s.events.values().sum::<u32>()
         ));
     }
 
     let payload = build_payload(&sessions);
+    dump_sync_payload(dir, "hook", &payload);
     let payload_str = serde_json::to_string(&payload).unwrap_or_default();
     let n = sessions.len();
 
@@ -194,6 +213,7 @@ pub fn cmd_sync_transcripts(dir: &Path) -> i32 {
 
         let byte_offset = cursor_val.get("byte_offset").and_then(|v| v.as_u64()).unwrap_or(0);
         let prev_request_id = cursor_val.get("last_request_id").and_then(|v| v.as_str()).unwrap_or("");
+        let prev_message_id = cursor_val.get("last_message_id").and_then(|v| v.as_str()).unwrap_or("");
         let prev_output_tokens = cursor_val.get("last_output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
         let fallback_project = cursor_val.get("project").and_then(|v| v.as_str()).unwrap_or("unknown");
         let fallback_path_hash = cursor_val.get("path_hash").and_then(|v| v.as_str()).unwrap_or("");
@@ -204,24 +224,73 @@ pub fn cmd_sync_transcripts(dir: &Path) -> i32 {
         }
 
         // If file shrunk (rotation/truncation), reset cursor to re-parse from start
-        let (parse_offset, parse_prev_rid, parse_prev_out) = if file_size < byte_offset {
+        let (parse_offset, parse_prev_rid, parse_prev_mid, parse_prev_out) = if file_size < byte_offset {
             sync_log(dir, &format!(
                 "[transcripts] File shrunk ({}B < {}B offset), resetting cursor",
                 file_size, byte_offset
             ));
-            (0u64, "", 0u64)
+            (0u64, "", "", 0u64)
         } else {
-            (byte_offset, prev_request_id, prev_output_tokens)
+            (byte_offset, prev_request_id, prev_message_id, prev_output_tokens)
         };
 
-        if let Some((session, new_offset, last_rid, last_out)) = parse_transcript_from_offset(
+        if let Some((mut session, new_offset, last_rid, last_mid, last_out)) = parse_transcript_from_offset(
             transcript_path,
             parse_offset,
             parse_prev_rid,
+            parse_prev_mid,
             parse_prev_out,
             fallback_project,
             fallback_path_hash,
         ) {
+            // Discover and parse subagent files for this session
+            let subagent_files = find_subagent_files(transcript_path);
+            for sub_path in &subagent_files {
+                let sub_key = sub_path.to_string_lossy().to_string();
+                let (sub_offset, sub_prev_rid, sub_prev_mid, sub_prev_out) =
+                    if let Some(sub_cursor) = cursors.get(&sub_key) {
+                        (
+                            sub_cursor.get("byte_offset").and_then(|v| v.as_u64()).unwrap_or(0),
+                            sub_cursor.get("last_request_id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                            sub_cursor.get("last_message_id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                            sub_cursor.get("last_output_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                        )
+                    } else {
+                        (0u64, String::new(), String::new(), 0u64)
+                    };
+
+                let sub_file_size = fs::metadata(sub_path).map(|m| m.len()).unwrap_or(0);
+                if sub_file_size == 0 || sub_file_size == sub_offset {
+                    continue;
+                }
+
+                if let Some((sub_session, sub_new_offset, sub_last_rid, sub_last_mid, sub_last_out)) =
+                    parse_transcript_from_offset(
+                        sub_path,
+                        sub_offset,
+                        &sub_prev_rid,
+                        &sub_prev_mid,
+                        sub_prev_out,
+                        fallback_project,
+                        fallback_path_hash,
+                    )
+                {
+                    merge_subagent_sessions(&mut session, sub_session);
+                    updated_cursors.push((
+                        sub_key,
+                        json!({
+                            "byte_offset": sub_new_offset,
+                            "session_id": cursor_val.get("session_id").and_then(|v| v.as_str()).unwrap_or(""),
+                            "project": fallback_project,
+                            "path_hash": fallback_path_hash,
+                            "last_request_id": sub_last_rid,
+                            "last_message_id": sub_last_mid,
+                            "last_output_tokens": sub_last_out
+                        }),
+                    ));
+                }
+            }
+
             sessions.push(session);
             updated_cursors.push((
                 transcript_key.clone(),
@@ -231,6 +300,7 @@ pub fn cmd_sync_transcripts(dir: &Path) -> i32 {
                     "project": cursor_val.get("project").and_then(|v| v.as_str()).unwrap_or("unknown"),
                     "path_hash": cursor_val.get("path_hash").and_then(|v| v.as_str()).unwrap_or(""),
                     "last_request_id": last_rid,
+                    "last_message_id": last_mid,
                     "last_output_tokens": last_out
                 }),
             ));
@@ -259,6 +329,7 @@ pub fn cmd_sync_transcripts(dir: &Path) -> i32 {
     }
 
     let payload = build_payload(&sessions);
+    dump_sync_payload(dir, "transcripts", &payload);
     let payload_str = serde_json::to_string(&payload).unwrap_or_default();
     let n = sessions.len();
 
@@ -313,6 +384,7 @@ pub fn dump_transcript_debug(dir: &Path) {
 
         let byte_offset = cursor_val.get("byte_offset").and_then(|v| v.as_u64()).unwrap_or(0);
         let prev_request_id = cursor_val.get("last_request_id").and_then(|v| v.as_str()).unwrap_or("");
+        let prev_message_id = cursor_val.get("last_message_id").and_then(|v| v.as_str()).unwrap_or("");
         let prev_output_tokens = cursor_val.get("last_output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
         let fallback_project = cursor_val.get("project").and_then(|v| v.as_str()).unwrap_or("unknown");
         let fallback_path_hash = cursor_val.get("path_hash").and_then(|v| v.as_str()).unwrap_or("");
@@ -324,6 +396,7 @@ pub fn dump_transcript_debug(dir: &Path) {
             "file_size": file_size,
             "byte_offset": byte_offset,
             "prev_request_id": prev_request_id,
+            "prev_message_id": prev_message_id,
             "prev_output_tokens": prev_output_tokens,
             "new_bytes": if file_size > byte_offset { file_size - byte_offset } else { 0 },
         }));
@@ -334,12 +407,14 @@ pub fn dump_transcript_debug(dir: &Path) {
 
         let parse_offset = if file_size < byte_offset { 0 } else { byte_offset };
         let parse_prev_rid = if file_size < byte_offset { "" } else { prev_request_id };
+        let parse_prev_mid = if file_size < byte_offset { "" } else { prev_message_id };
         let parse_prev_out = if file_size < byte_offset { 0 } else { prev_output_tokens };
 
-        if let Some((session, new_offset, last_rid, last_out)) = parse_transcript_from_offset(
+        if let Some((mut session, new_offset, last_rid, last_mid, last_out)) = parse_transcript_from_offset(
             transcript_path,
             parse_offset,
             parse_prev_rid,
+            parse_prev_mid,
             parse_prev_out,
             fallback_project,
             fallback_path_hash,
@@ -347,8 +422,20 @@ pub fn dump_transcript_debug(dir: &Path) {
             cursor_snapshots.last_mut().map(|c| {
                 c["parsed_new_offset"] = json!(new_offset);
                 c["parsed_last_rid"] = json!(last_rid);
+                c["parsed_last_mid"] = json!(last_mid);
                 c["parsed_last_out"] = json!(last_out);
             });
+
+            // Discover and parse subagent files
+            let subagent_files = find_subagent_files(transcript_path);
+            for sub_path in &subagent_files {
+                if let Some((sub_session, _, _, _, _)) = parse_transcript_from_offset(
+                    sub_path, 0, "", "", 0, fallback_project, fallback_path_hash,
+                ) {
+                    merge_subagent_sessions(&mut session, sub_session);
+                }
+            }
+
             sessions.push(session);
         }
     }
@@ -358,6 +445,7 @@ pub fn dump_transcript_debug(dir: &Path) {
 
     let session_data: Vec<serde_json::Value> = sessions.iter().map(|s| {
         let tool_count: u32 = s.tools.values().sum();
+        let subagent_count = s.requests.iter().filter(|r| r.is_subagent).count();
         json!({
             "session_id": s.session_id,
             "project": s.project,
@@ -369,6 +457,8 @@ pub fn dump_transcript_debug(dir: &Path) {
             "prompt_count": s.prompt_count,
             "tool_count": tool_count,
             "tools": s.tools,
+            "request_count": s.requests.len(),
+            "subagent_request_count": subagent_count,
             "total_input_tokens": s.total_input_tokens,
             "total_output_tokens": s.total_output_tokens,
             "total_cache_read_tokens": s.total_cache_read_tokens,
@@ -402,4 +492,122 @@ pub fn dump_transcript_debug(dir: &Path) {
         sessions.len(),
         debug_file.file_name().unwrap_or_default().to_string_lossy()
     ));
+}
+
+/// Dry-run sync: parse all cursored transcripts and show what would be synced.
+/// Does NOT advance cursors or POST to backend.
+pub fn cmd_sync_dry(dir: &Path, project_filter: Option<&str>) -> i32 {
+    let cursors = read_cursors(dir);
+    if cursors.is_empty() {
+        eprintln!("No transcript cursors found. Run a sync or import first.");
+        return 1;
+    }
+
+    let mut sessions: Vec<Session> = Vec::new();
+
+    for (transcript_key, cursor_val) in &cursors {
+        let transcript_path = Path::new(transcript_key.as_str());
+        if !transcript_path.exists() {
+            continue;
+        }
+
+        let byte_offset = cursor_val.get("byte_offset").and_then(|v| v.as_u64()).unwrap_or(0);
+        let prev_request_id = cursor_val.get("last_request_id").and_then(|v| v.as_str()).unwrap_or("");
+        let prev_message_id = cursor_val.get("last_message_id").and_then(|v| v.as_str()).unwrap_or("");
+        let prev_output_tokens = cursor_val.get("last_output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+        let fallback_project = cursor_val.get("project").and_then(|v| v.as_str()).unwrap_or("unknown");
+        let fallback_path_hash = cursor_val.get("path_hash").and_then(|v| v.as_str()).unwrap_or("");
+
+        let file_size = fs::metadata(transcript_path).map(|m| m.len()).unwrap_or(0);
+        if file_size == 0 || file_size == byte_offset {
+            continue;
+        }
+
+        let parse_offset = if file_size < byte_offset { 0 } else { byte_offset };
+        let parse_prev_rid = if file_size < byte_offset { "" } else { prev_request_id };
+        let parse_prev_mid = if file_size < byte_offset { "" } else { prev_message_id };
+        let parse_prev_out = if file_size < byte_offset { 0 } else { prev_output_tokens };
+
+        if let Some((mut session, _, _, _, _)) = parse_transcript_from_offset(
+            transcript_path,
+            parse_offset,
+            parse_prev_rid,
+            parse_prev_mid,
+            parse_prev_out,
+            fallback_project,
+            fallback_path_hash,
+        ) {
+            // Discover and parse subagent files
+            let subagent_files = find_subagent_files(transcript_path);
+            for sub_path in &subagent_files {
+                let sub_key = sub_path.to_string_lossy().to_string();
+                let (sub_offset, sub_prev_rid, sub_prev_mid, sub_prev_out) =
+                    if let Some(sub_cursor) = cursors.get(&sub_key) {
+                        (
+                            sub_cursor.get("byte_offset").and_then(|v| v.as_u64()).unwrap_or(0),
+                            sub_cursor.get("last_request_id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                            sub_cursor.get("last_message_id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                            sub_cursor.get("last_output_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                        )
+                    } else {
+                        (0u64, String::new(), String::new(), 0u64)
+                    };
+
+                let sub_file_size = fs::metadata(sub_path).map(|m| m.len()).unwrap_or(0);
+                if sub_file_size == 0 || sub_file_size == sub_offset {
+                    continue;
+                }
+
+                if let Some((sub_session, _, _, _, _)) = parse_transcript_from_offset(
+                    sub_path, sub_offset, &sub_prev_rid, &sub_prev_mid, sub_prev_out,
+                    fallback_project, fallback_path_hash,
+                ) {
+                    merge_subagent_sessions(&mut session, sub_session);
+                }
+            }
+
+            sessions.push(session);
+        }
+    }
+
+    // Optionally filter by project name
+    if let Some(filter) = project_filter {
+        let filter_lower = filter.to_lowercase();
+        sessions.retain(|s| s.project.to_lowercase().contains(&filter_lower));
+    }
+
+    if sessions.is_empty() {
+        eprintln!("No new data to sync.");
+        return 0;
+    }
+
+    let total_requests: usize = sessions.iter().map(|s| s.requests.len()).sum();
+    let subagent_requests: usize = sessions.iter()
+        .flat_map(|s| s.requests.iter())
+        .filter(|r| r.is_subagent)
+        .count();
+    let total_input: u64 = sessions.iter().map(|s| s.total_input_tokens).sum();
+    let total_output: u64 = sessions.iter().map(|s| s.total_output_tokens).sum();
+    let projects: std::collections::HashSet<&str> = sessions.iter().map(|s| s.project.as_str()).collect();
+
+    let payload = build_payload(&sessions);
+    let payload_path = dir.join("dry-run-sync.json");
+    if let Ok(pretty) = serde_json::to_string_pretty(&payload) {
+        let _ = fs::write(&payload_path, &pretty);
+    }
+
+    eprintln!("Dry-run sync preview:");
+    eprintln!("  Sessions:    {}", sessions.len());
+    if subagent_requests > 0 {
+        eprintln!("  Requests:    {} ({} subagent)", total_requests, subagent_requests);
+    } else {
+        eprintln!("  Requests:    {}", total_requests);
+    }
+    eprintln!("  Input tokens:  {}", total_input);
+    eprintln!("  Output tokens: {}", total_output);
+    let project_list: Vec<&str> = projects.into_iter().collect();
+    eprintln!("  Projects:    {}", project_list.join(", "));
+    eprintln!("  Payload:     {}", payload_path.display());
+
+    0
 }

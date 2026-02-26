@@ -42,9 +42,13 @@ pub fn config_get(dir: &Path, key: &str) -> Option<String> {
 }
 
 pub fn config_get_bool(dir: &Path, key: &str) -> bool {
+    config_get_bool_default(dir, key, false)
+}
+
+pub fn config_get_bool_default(dir: &Path, key: &str, default: bool) -> bool {
     read_config(dir)
         .and_then(|cfg| cfg.get(key)?.as_bool())
-        .unwrap_or(false)
+        .unwrap_or(default)
 }
 
 pub fn config_set_bool(dir: &Path, key: &str, value: bool) -> io::Result<()> {

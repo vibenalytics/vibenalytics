@@ -107,7 +107,8 @@ fn compute_import_stats(selected_dirs: &HashSet<String>) -> ImportStats {
     let mut total_prompts = 0u32;
     let mut total_tools = 0u32;
 
-    for (project_name, ph, path) in &sessions_list {
+    for (project_name, ph, path, is_subagent, _) in &sessions_list {
+        if *is_subagent { continue; }
         if let Some(session) = parse_session_transcript(path, project_name, ph) {
             total_sessions += 1;
             total_prompts += session.prompt_count;
