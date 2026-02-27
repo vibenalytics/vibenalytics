@@ -2,7 +2,7 @@ use std::io::{self, Read};
 use std::path::Path;
 use serde_json::{json, Value};
 use crate::hash::hash_path;
-use crate::sync::{cmd_sync_transcripts, dump_transcript_debug, SYNC_EVENTS};
+use crate::sync::{cmd_sync_single_transcript, dump_transcript_debug, SYNC_EVENTS};
 use crate::transcripts::{read_cursors, write_cursors};
 
 pub fn cmd_log(dir: &Path) -> i32 {
@@ -51,7 +51,8 @@ pub fn cmd_log(dir: &Path) -> i32 {
                     "project": proj,
                     "path_hash": ph,
                     "last_request_id": "",
-                    "last_output_tokens": 0
+                    "last_output_tokens": 0,
+                    "last_prompt_count": 0
                 }));
                 write_cursors(dir, &cursors);
             }
@@ -70,9 +71,17 @@ pub fn cmd_log(dir: &Path) -> i32 {
     ));
 
     if is_boundary {
+        // Wait for transcript writes to flush before parsing.
+        // Stop fires before the final assistant message is fully written (~500ms race).
+        std::thread::sleep(std::time::Duration::from_secs(2));
+
         let auto_sync = crate::config::config_get_bool_default(dir, "autoSync", true);
         if auto_sync {
-            cmd_sync_transcripts(dir);
+            if let Some(tp) = transcript_path {
+                cmd_sync_single_transcript(dir, tp, event_name);
+            } else {
+                crate::paths::sync_log(dir, "[hook] No transcript_path, skipping sync");
+            }
         }
         if crate::config::config_get_bool(dir, "debugMode") {
             dump_transcript_debug(dir);

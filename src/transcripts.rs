@@ -6,7 +6,7 @@ use std::time::SystemTime;
 use serde_json::Value;
 use crate::hash::hash_path;
 use crate::paths::cursors_path;
-use crate::aggregation::{Session, RequestUsage};
+use crate::aggregation::{Session, RequestUsage, PromptUsage, classify_prompt};
 
 // ---- Cursor state ----
 
@@ -218,6 +218,16 @@ pub fn find_subagent_files(parent_transcript: &Path) -> Vec<PathBuf> {
     results
 }
 
+// ---- Prompt detection ----
+
+/// Returns true if a user event represents a real typed prompt (not system noise).
+fn is_real_user_prompt(content: &str) -> bool {
+    !content.is_empty()
+        && !content.starts_with("<local-command")
+        && !content.starts_with("<bash-")
+        && !content.starts_with("/plugin")
+}
+
 // ---- Full transcript parsing ----
 
 struct FullParseAccum {
@@ -230,6 +240,7 @@ struct FullParseAccum {
     cache_read_tokens: u64,
     cache_creation_tokens: u64,
     seen_tool_use_ids: HashSet<String>,
+    prompt_index: i32,
 }
 
 pub fn parse_session_transcript(filepath: &Path, fallback_project: &str, fallback_path_hash: &str) -> Option<Session> {
@@ -241,6 +252,13 @@ pub fn parse_session_transcript(filepath: &Path, fallback_project: &str, fallbac
 
     let mut accum_map: HashMap<String, FullParseAccum> = HashMap::new();
     let mut seen_user_messages: HashSet<String> = HashSet::new();
+    let mut current_prompt_index: i32 = -1;
+    let mut current_prompt_tools: HashMap<String, u32> = HashMap::new();
+    let mut current_prompt_ts = String::new();
+    let mut current_prompt_text = String::new();
+    let mut current_prompt_type = String::new();
+    let mut current_prompt_command = String::new();
+    let mut pending_compaction: Option<(String, u64)> = None; // (trigger, pre_tokens)
 
     for line_result in reader.lines() {
         let line = match line_result {
@@ -316,6 +334,7 @@ pub fn parse_session_transcript(filepath: &Path, fallback_project: &str, fallbac
                     cache_read_tokens: 0,
                     cache_creation_tokens: 0,
                     seen_tool_use_ids: HashSet::new(),
+                    prompt_index: current_prompt_index.max(0),
                 });
 
                 if !model.is_empty() {
@@ -345,9 +364,11 @@ pub fn parse_session_transcript(filepath: &Path, fallback_project: &str, fallbac
                             if !tool_id.is_empty() && accum.seen_tool_use_ids.insert(tool_id.to_string()) {
                                 let tool = block.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
                                 *session.tools.entry(tool.to_string()).or_insert(0) += 1;
+                                *current_prompt_tools.entry(tool.to_string()).or_insert(0) += 1;
                             } else if tool_id.is_empty() {
                                 let tool = block.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
                                 *session.tools.entry(tool.to_string()).or_insert(0) += 1;
+                                *current_prompt_tools.entry(tool.to_string()).or_insert(0) += 1;
                             }
                         }
                     }
@@ -359,13 +380,97 @@ pub fn parse_session_transcript(filepath: &Path, fallback_project: &str, fallbac
                 if !user_msg_id.is_empty() && !seen_user_messages.insert(user_msg_id) {
                     continue; // duplicate user message
                 }
+                // Compaction summary: flush current prompt and start a compaction entry
+                let is_compact_summary = evt.get("isCompactSummary")
+                    .and_then(|v| v.as_bool()).unwrap_or(false);
+                if is_compact_summary {
+                    // Flush current prompt before compaction
+                    if current_prompt_index >= 0 {
+                        session.prompts.push(PromptUsage {
+                            prompt_index: current_prompt_index,
+                            timestamp: current_prompt_ts.clone(),
+                            input_tokens: 0,
+                            output_tokens: 0,
+                            cache_read_tokens: 0,
+                            cache_creation_tokens: 0,
+                            request_count: 0,
+                            tools: std::mem::take(&mut current_prompt_tools),
+                            model: String::new(),
+                            prompt_text: std::mem::take(&mut current_prompt_text),
+                            msg_type: std::mem::take(&mut current_prompt_type),
+                            command: std::mem::take(&mut current_prompt_command),
+                            subagent_count: 0,
+                            compaction_trigger: String::new(),
+                            compaction_pre_tokens: 0,
+                            context_tokens: 0,
+                        });
+                    }
+                    current_prompt_index += 1;
+                    current_prompt_tools.clear();
+                    current_prompt_ts = evt.get("timestamp")
+                        .and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    current_prompt_text = String::new();
+                    current_prompt_type = "compaction".to_string();
+                    current_prompt_command = String::new();
+                    // Attach compaction metadata from pending system event
+                    if let Some((trigger, pre_tokens)) = pending_compaction.take() {
+                        session.prompts.push(PromptUsage {
+                            prompt_index: current_prompt_index,
+                            timestamp: current_prompt_ts.clone(),
+                            input_tokens: 0,
+                            output_tokens: 0,
+                            cache_read_tokens: 0,
+                            cache_creation_tokens: 0,
+                            request_count: 0,
+                            tools: HashMap::new(),
+                            model: String::new(),
+                            prompt_text: String::new(),
+                            msg_type: "compaction".to_string(),
+                            command: String::new(),
+                            subagent_count: 0,
+                            compaction_trigger: trigger,
+                            compaction_pre_tokens: pre_tokens,
+                            context_tokens: 0,
+                        });
+                    }
+                    continue;
+                }
                 session.message_count += 1;
-                let is_prompt = evt
-                    .pointer("/message/content")
-                    .map(|v| v.is_string())
-                    .unwrap_or(false);
-                if is_prompt {
-                    session.prompt_count += 1;
+                let content_str = evt.pointer("/message/content")
+                    .and_then(|v| v.as_str());
+                if let Some(text) = content_str {
+                    if is_real_user_prompt(text) {
+                        // Save previous prompt before starting new one
+                        if current_prompt_index >= 0 {
+                            session.prompts.push(PromptUsage {
+                                prompt_index: current_prompt_index,
+                                timestamp: current_prompt_ts.clone(),
+                                input_tokens: 0,
+                                output_tokens: 0,
+                                cache_read_tokens: 0,
+                                cache_creation_tokens: 0,
+                                request_count: 0,
+                                tools: std::mem::take(&mut current_prompt_tools),
+                                model: String::new(),
+                                prompt_text: std::mem::take(&mut current_prompt_text),
+                                msg_type: std::mem::take(&mut current_prompt_type),
+                                command: std::mem::take(&mut current_prompt_command),
+                                subagent_count: 0,
+                                compaction_trigger: String::new(),
+                                compaction_pre_tokens: 0,
+                                context_tokens: 0,
+                            });
+                        }
+                        current_prompt_index += 1;
+                        current_prompt_tools.clear();
+                        current_prompt_ts = evt.get("timestamp")
+                            .and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        current_prompt_text = text.chars().take(500).collect();
+                        let (pt, pc) = classify_prompt(text);
+                        current_prompt_type = pt;
+                        current_prompt_command = pc;
+                        session.prompt_count += 1;
+                    }
                 }
                 if let Some(pm) = evt.get("permissionMode").and_then(|v| v.as_str()) {
                     session.permission_mode = pm.to_string();
@@ -383,8 +488,40 @@ pub fn parse_session_transcript(filepath: &Path, fallback_project: &str, fallbac
                     }
                 }
             }
+            "system" => {
+                let subtype = evt.get("subtype").and_then(|v| v.as_str()).unwrap_or("");
+                if subtype == "compact_boundary" {
+                    let trigger = evt.pointer("/compactMetadata/trigger")
+                        .and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+                    let pre_tokens = evt.pointer("/compactMetadata/preTokens")
+                        .and_then(|v| v.as_u64()).unwrap_or(0);
+                    pending_compaction = Some((trigger, pre_tokens));
+                }
+            }
             _ => {}
         }
+    }
+
+    // Flush the last prompt
+    if current_prompt_index >= 0 {
+        session.prompts.push(PromptUsage {
+            prompt_index: current_prompt_index,
+            timestamp: current_prompt_ts,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            request_count: 0,
+            tools: current_prompt_tools,
+            model: String::new(),
+            prompt_text: current_prompt_text,
+            msg_type: current_prompt_type,
+            command: current_prompt_command,
+            subagent_count: 0,
+            compaction_trigger: String::new(),
+            compaction_pre_tokens: 0,
+            context_tokens: 0,
+        });
     }
 
     if session.session_id == "unknown" && session.message_count == 0 {
@@ -411,6 +548,7 @@ pub fn parse_session_transcript(filepath: &Path, fallback_project: &str, fallbac
             cache_read_tokens: accum.cache_read_tokens,
             cache_creation_tokens: accum.cache_creation_tokens,
             is_subagent: false,
+            prompt_index: accum.prompt_index,
         });
     }
 
@@ -436,6 +574,7 @@ struct RequestAccum {
     cache_read_tokens: u64,
     cache_creation_tokens: u64,
     seen_tool_use_ids: HashSet<String>,
+    prompt_index: i32,
 }
 
 /// Returns (Session, new_byte_offset, last_request_id, last_message_id, last_output_tokens).
@@ -447,6 +586,7 @@ pub fn parse_transcript_from_offset(
     prev_output_tokens: u64,
     fallback_project: &str,
     fallback_path_hash: &str,
+    prompt_index_offset: i32,
 ) -> Option<(Session, u64, String, String, u64)> {
     let file_size = fs::metadata(filepath).ok()?.len();
     let start_offset = if file_size < byte_offset { 0 } else { byte_offset };
@@ -464,6 +604,13 @@ pub fn parse_transcript_from_offset(
     let mut current_offset = start_offset;
     let mut lines_parsed = 0u32;
     let mut seen_user_messages: HashSet<String> = HashSet::new();
+    let mut current_prompt_index: i32 = prompt_index_offset - 1;
+    let mut current_prompt_tools: HashMap<String, u32> = HashMap::new();
+    let mut current_prompt_ts = String::new();
+    let mut current_prompt_text = String::new();
+    let mut current_prompt_type = String::new();
+    let mut current_prompt_command = String::new();
+    let mut pending_compaction: Option<(String, u64)> = None; // (trigger, pre_tokens)
 
     for line_result in reader.lines() {
         let line = match line_result {
@@ -546,6 +693,7 @@ pub fn parse_transcript_from_offset(
                     cache_read_tokens: 0,
                     cache_creation_tokens: 0,
                     seen_tool_use_ids: HashSet::new(),
+                    prompt_index: current_prompt_index.max(0),
                 });
 
                 if !model.is_empty() {
@@ -581,9 +729,11 @@ pub fn parse_transcript_from_offset(
                             if !tool_id.is_empty() && accum.seen_tool_use_ids.insert(tool_id.to_string()) {
                                 let tool = block.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
                                 *session.tools.entry(tool.to_string()).or_insert(0) += 1;
+                                *current_prompt_tools.entry(tool.to_string()).or_insert(0) += 1;
                             } else if tool_id.is_empty() {
                                 let tool = block.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
                                 *session.tools.entry(tool.to_string()).or_insert(0) += 1;
+                                *current_prompt_tools.entry(tool.to_string()).or_insert(0) += 1;
                             }
                         }
                     }
@@ -595,13 +745,94 @@ pub fn parse_transcript_from_offset(
                 if !user_msg_id.is_empty() && !seen_user_messages.insert(user_msg_id) {
                     continue;
                 }
+                // Compaction summary: flush current prompt and start a compaction entry
+                let is_compact_summary = evt.get("isCompactSummary")
+                    .and_then(|v| v.as_bool()).unwrap_or(false);
+                if is_compact_summary {
+                    if current_prompt_index >= 0 {
+                        session.prompts.push(PromptUsage {
+                            prompt_index: current_prompt_index,
+                            timestamp: current_prompt_ts.clone(),
+                            input_tokens: 0,
+                            output_tokens: 0,
+                            cache_read_tokens: 0,
+                            cache_creation_tokens: 0,
+                            request_count: 0,
+                            tools: std::mem::take(&mut current_prompt_tools),
+                            model: String::new(),
+                            prompt_text: std::mem::take(&mut current_prompt_text),
+                            msg_type: std::mem::take(&mut current_prompt_type),
+                            command: std::mem::take(&mut current_prompt_command),
+                            subagent_count: 0,
+                            compaction_trigger: String::new(),
+                            compaction_pre_tokens: 0,
+                            context_tokens: 0,
+                        });
+                    }
+                    current_prompt_index += 1;
+                    current_prompt_tools.clear();
+                    current_prompt_ts = evt.get("timestamp")
+                        .and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    current_prompt_text = String::new();
+                    current_prompt_type = "compaction".to_string();
+                    current_prompt_command = String::new();
+                    if let Some((trigger, pre_tokens)) = pending_compaction.take() {
+                        session.prompts.push(PromptUsage {
+                            prompt_index: current_prompt_index,
+                            timestamp: current_prompt_ts.clone(),
+                            input_tokens: 0,
+                            output_tokens: 0,
+                            cache_read_tokens: 0,
+                            cache_creation_tokens: 0,
+                            request_count: 0,
+                            tools: HashMap::new(),
+                            model: String::new(),
+                            prompt_text: String::new(),
+                            msg_type: "compaction".to_string(),
+                            command: String::new(),
+                            subagent_count: 0,
+                            compaction_trigger: trigger,
+                            compaction_pre_tokens: pre_tokens,
+                            context_tokens: 0,
+                        });
+                    }
+                    continue;
+                }
                 session.message_count += 1;
-                let is_prompt = evt
-                    .pointer("/message/content")
-                    .map(|v| v.is_string())
-                    .unwrap_or(false);
-                if is_prompt {
-                    session.prompt_count += 1;
+                let content_str = evt.pointer("/message/content")
+                    .and_then(|v| v.as_str());
+                if let Some(text) = content_str {
+                    if is_real_user_prompt(text) {
+                        if current_prompt_index >= 0 {
+                            session.prompts.push(PromptUsage {
+                                prompt_index: current_prompt_index,
+                                timestamp: current_prompt_ts.clone(),
+                                input_tokens: 0,
+                                output_tokens: 0,
+                                cache_read_tokens: 0,
+                                cache_creation_tokens: 0,
+                                request_count: 0,
+                                tools: std::mem::take(&mut current_prompt_tools),
+                                model: String::new(),
+                                prompt_text: std::mem::take(&mut current_prompt_text),
+                                msg_type: std::mem::take(&mut current_prompt_type),
+                                command: std::mem::take(&mut current_prompt_command),
+                                subagent_count: 0,
+                                compaction_trigger: String::new(),
+                                compaction_pre_tokens: 0,
+                                context_tokens: 0,
+                            });
+                        }
+                        current_prompt_index += 1;
+                        current_prompt_tools.clear();
+                        current_prompt_ts = evt.get("timestamp")
+                            .and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        current_prompt_text = text.chars().take(500).collect();
+                        let (pt, pc) = classify_prompt(text);
+                        current_prompt_type = pt;
+                        current_prompt_command = pc;
+                        session.prompt_count += 1;
+                    }
                 }
                 if let Some(pm) = evt.get("permissionMode").and_then(|v| v.as_str()) {
                     session.permission_mode = pm.to_string();
@@ -627,9 +858,38 @@ pub fn parse_transcript_from_offset(
                         session.turn_count += 1;
                     }
                 }
+                if subtype == "compact_boundary" {
+                    let trigger = evt.pointer("/compactMetadata/trigger")
+                        .and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+                    let pre_tokens = evt.pointer("/compactMetadata/preTokens")
+                        .and_then(|v| v.as_u64()).unwrap_or(0);
+                    pending_compaction = Some((trigger, pre_tokens));
+                }
             }
             _ => {}
         }
+    }
+
+    // Flush the last prompt
+    if current_prompt_index >= 0 {
+        session.prompts.push(PromptUsage {
+            prompt_index: current_prompt_index,
+            timestamp: current_prompt_ts,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            request_count: 0,
+            tools: current_prompt_tools,
+            model: String::new(),
+            prompt_text: current_prompt_text,
+            msg_type: current_prompt_type,
+            command: current_prompt_command,
+            subagent_count: 0,
+            compaction_trigger: String::new(),
+            compaction_pre_tokens: 0,
+            context_tokens: 0,
+        });
     }
 
     if lines_parsed == 0 {
@@ -680,6 +940,7 @@ pub fn parse_transcript_from_offset(
             cache_read_tokens: if is_boundary { 0 } else { accum.cache_read_tokens },
             cache_creation_tokens: if is_boundary { 0 } else { accum.cache_creation_tokens },
             is_subagent: false,
+            prompt_index: accum.prompt_index,
         });
     }
 
@@ -702,12 +963,63 @@ pub fn parse_transcript_from_offset(
 // ---- Subagent merging ----
 
 pub fn merge_subagent_sessions(parent: &mut Session, subagent: Session) {
+    // Build prompt timestamp ranges for attribution
+    let mut prompt_ranges: Vec<(i32, String, String)> = Vec::new();
+    {
+        let mut prompt_timestamps: Vec<(i32, String)> = parent.prompts.iter()
+            .map(|p| (p.prompt_index, p.timestamp.clone()))
+            .collect();
+        // Also check requests for prompt timestamps (prompts vec only has entries with tools)
+        for req in &parent.requests {
+            if !prompt_timestamps.iter().any(|(idx, _)| *idx == req.prompt_index) {
+                prompt_timestamps.push((req.prompt_index, req.timestamp.clone()));
+            }
+        }
+        prompt_timestamps.sort_by(|a, b| a.0.cmp(&b.0));
+        for i in 0..prompt_timestamps.len() {
+            let (idx, start) = &prompt_timestamps[i];
+            let end = if i + 1 < prompt_timestamps.len() {
+                prompt_timestamps[i + 1].1.clone()
+            } else {
+                "9999".to_string()
+            };
+            prompt_ranges.push((*idx, start.clone(), end));
+        }
+    }
+
+    let mut prompts_with_subagent: HashSet<i32> = HashSet::new();
+
     for mut req in subagent.requests {
         req.is_subagent = true;
+        // Assign prompt_index based on timestamp range
+        if !prompt_ranges.is_empty() {
+            for (idx, start, end) in &prompt_ranges {
+                if req.timestamp >= *start && req.timestamp < *end {
+                    req.prompt_index = *idx;
+                    break;
+                }
+            }
+            // If no range matched (e.g. after last prompt), assign to last prompt
+            if !req.timestamp.is_empty() && req.prompt_index == 0 && !prompt_ranges.is_empty() {
+                if let Some((last_idx, last_start, _)) = prompt_ranges.last() {
+                    if req.timestamp >= *last_start {
+                        req.prompt_index = *last_idx;
+                    }
+                }
+            }
+        }
+        prompts_with_subagent.insert(req.prompt_index);
         parent.total_input_tokens += req.input_tokens;
         parent.total_output_tokens += req.output_tokens;
         parent.total_cache_read_tokens += req.cache_read_tokens;
         parent.total_cache_creation_tokens += req.cache_creation_tokens;
         parent.requests.push(req);
+    }
+
+    // Increment subagent_count for each prompt that received requests from this subagent
+    for prompt in &mut parent.prompts {
+        if prompts_with_subagent.contains(&prompt.prompt_index) {
+            prompt.subagent_count += 1;
+        }
     }
 }

@@ -64,7 +64,7 @@ fn do_import_bg(
 
     for (project_name, ph, path, _, _) in &parent_sessions {
         let (mut session, new_offset, last_rid, last_mid, last_out) =
-            match parse_transcript_from_offset(path, 0, "", "", 0, project_name, ph) {
+            match parse_transcript_from_offset(path, 0, "", "", 0, project_name, ph, 0) {
                 Some(r) => r,
                 None => continue,
             };
@@ -73,7 +73,7 @@ fn do_import_bg(
         let subagent_files = find_subagent_files(path);
         for sub_path in &subagent_files {
             if let Some((sub_session, sub_offset, sub_rid, sub_mid, sub_out)) =
-                parse_transcript_from_offset(sub_path, 0, "", "", 0, project_name, ph)
+                parse_transcript_from_offset(sub_path, 0, "", "", 0, project_name, ph, 0)
             {
                 merge_subagent_sessions(&mut session, sub_session);
                 let sub_key = sub_path.to_string_lossy().to_string();
@@ -224,7 +224,7 @@ pub fn cmd_import(dir: &Path, project_filter: Option<&str>, do_sync: bool) -> i3
         eprint!("\r  [{}/{}] Parsing {}...", i + 1, parent_sessions.len(), file_name);
 
         let (mut session, new_offset, last_rid, last_mid, last_out) =
-            match parse_transcript_from_offset(path, 0, "", "", 0, project_name, ph) {
+            match parse_transcript_from_offset(path, 0, "", "", 0, project_name, ph, 0) {
                 Some(r) => r,
                 None => continue,
             };
@@ -233,7 +233,7 @@ pub fn cmd_import(dir: &Path, project_filter: Option<&str>, do_sync: bool) -> i3
         let subagent_files = find_subagent_files(path);
         for sub_path in &subagent_files {
             if let Some((sub_session, sub_offset, sub_rid, sub_mid, sub_out)) =
-                parse_transcript_from_offset(sub_path, 0, "", "", 0, project_name, ph)
+                parse_transcript_from_offset(sub_path, 0, "", "", 0, project_name, ph, 0)
             {
                 merge_subagent_sessions(&mut session, sub_session);
                 let sub_key = sub_path.to_string_lossy().to_string();

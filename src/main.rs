@@ -113,6 +113,13 @@ enum Commands {
         #[arg(long)]
         use_transcripts: bool,
     },
+
+    /// (debug) Parse a transcript file and print the payload JSON
+    #[command(hide = true)]
+    ParseTranscript {
+        /// Path to the .jsonl transcript file
+        file: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -168,6 +175,7 @@ enum SettingsAction {
 const SETTINGS_HELP: &[(&str, &str, &str)] = &[
     ("autoSync", "bool", "Auto-sync on boundary events (default: true)"),
     ("syncSource", "string", "Sync source: 'transcripts' or 'hook' (default: transcripts)"),
+    ("localSync", "bool", "[DEV] Sync to local files instead of backend (default: false)"),
     ("debugMode", "bool", "Write debug transcript dumps (default: false)"),
 ];
 
@@ -437,6 +445,26 @@ fn main() {
 
         Some(Commands::Log { .. }) => {
             log_cmd::cmd_log(&dir)
+        }
+
+        Some(Commands::ParseTranscript { file }) => {
+            let path = std::path::PathBuf::from(&file);
+            match transcripts::parse_session_transcript(&path, "test", "") {
+                Some(mut session) => {
+                    for sub_path in transcripts::find_subagent_files(&path) {
+                        if let Some(sub) = transcripts::parse_session_transcript(&sub_path, "test", "") {
+                            transcripts::merge_subagent_sessions(&mut session, sub);
+                        }
+                    }
+                    let payload = aggregation::build_payload(&[session]);
+                    println!("{}", serde_json::to_string_pretty(&payload).unwrap_or_default());
+                    0
+                }
+                None => {
+                    eprintln!("Failed to parse transcript: {}", file);
+                    1
+                }
+            }
         }
     };
 

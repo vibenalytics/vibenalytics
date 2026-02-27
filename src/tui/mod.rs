@@ -75,6 +75,7 @@ struct App {
     onboarding: Option<onboarding::OnboardingState>,
     use_transcripts: bool,
     auto_sync: bool,
+    local_sync: bool,
     debug_mode: bool,
     debug_log: Vec<String>,
     last_debug_reload: Instant,
@@ -113,6 +114,7 @@ impl App {
         let use_transcripts = config_get(dir, "syncSource")
             .map(|s| s == "transcripts").unwrap_or(false);
         let auto_sync = config_get_bool_default(dir, "autoSync", true);
+        let local_sync = config_get_bool(dir, "localSync");
         let debug_mode = config_get_bool(dir, "debugMode");
 
         App {
@@ -131,6 +133,7 @@ impl App {
             onboarding,
             use_transcripts,
             auto_sync,
+            local_sync,
             debug_mode,
             debug_log: Vec::new(),
             last_debug_reload: Instant::now(),
@@ -440,6 +443,14 @@ impl App {
                 }
             }
             5 => {
+                let new_val = !self.local_sync;
+                if let Ok(()) = config_set_bool(&self.dir, "localSync", new_val) {
+                    self.local_sync = new_val;
+                    let label = if new_val { "enabled" } else { "disabled" };
+                    self.status_msg = format!("Local sync {label}");
+                }
+            }
+            6 => {
                 let new_val = !self.debug_mode;
                 if let Ok(()) = config_set_bool(&self.dir, "debugMode", new_val) {
                     self.debug_mode = new_val;
@@ -453,7 +464,7 @@ impl App {
                     }
                 }
             }
-            6 => {
+            7 => {
                 crate::auth::cmd_logout(&self.dir);
                 self.status_msg = "Logged out".into();
                 self.reload();
@@ -690,7 +701,7 @@ pub fn run(dir: &Path) -> i32 {
                 Tab::Dashboard => dashboard::render(frame, layout[2]),
                 Tab::Sessions => sessions::render(frame, layout[2], &app.sessions_state),
                 Tab::Projects => projects::render(frame, layout[2], &mut app.projects_state),
-                Tab::Settings => settings::render(frame, layout[2], &app.settings_state, &app.user_name, app.connected, app.pending_events, app.projects_state.registry.default_enabled, app.use_transcripts, app.auto_sync, app.debug_mode, &app.debug_log, &app.dir),
+                Tab::Settings => settings::render(frame, layout[2], &app.settings_state, &app.user_name, app.connected, app.pending_events, app.projects_state.registry.default_enabled, app.use_transcripts, app.auto_sync, app.local_sync, app.debug_mode, &app.debug_log, &app.dir),
             }
 
             if has_status {

@@ -3,7 +3,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
 use super::theme;
 
-pub const ACTION_COUNT: usize = 7;
+pub const ACTION_COUNT: usize = 8;
 
 pub struct SettingsState {
     pub selected: usize,
@@ -46,6 +46,7 @@ pub fn render(
     default_enabled: bool,
     use_transcripts: bool,
     auto_sync: bool,
+    local_sync: bool,
     debug_mode: bool,
     debug_lines: &[String],
     data_dir: &Path,
@@ -66,7 +67,7 @@ pub fn render(
     }
 
     // Split: settings info+actions on top, debug log on bottom (when enabled)
-    let settings_height = if debug_mode { 18u16 } else { 17u16 };
+    let settings_height = if debug_mode { 19u16 } else { 18u16 };
     let (settings_area, debug_area) = if debug_mode && !debug_lines.is_empty() {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -116,6 +117,7 @@ pub fn render(
 
     let auto_sync_label = if auto_sync { "Disable auto sync" } else { "Enable auto sync" };
     let data_source_label = if use_transcripts { "Switch to hooks" } else { "Switch to transcripts" };
+    let local_sync_label = if local_sync { "[DEV] Local sync: ON" } else { "[DEV] Local sync: OFF" };
     let debug_label = if debug_mode { "Debug Mode: ON" } else { "Debug Mode: OFF" };
     let actions = [
         "Force Sync",
@@ -123,6 +125,7 @@ pub fn render(
         auto_sync_label,
         if default_enabled { "Switch to manual mode" } else { "Switch to auto mode" },
         data_source_label,
+        local_sync_label,
         debug_label,
         "Logout",
     ];
