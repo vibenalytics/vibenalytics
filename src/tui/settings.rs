@@ -3,7 +3,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
 use super::theme;
 
-pub const ACTION_COUNT: usize = 8;
+pub const ACTION_COUNT: usize = 6;
 
 pub struct SettingsState {
     pub selected: usize,
@@ -42,9 +42,7 @@ pub fn render(
     state: &SettingsState,
     user_name: &str,
     connected: bool,
-    pending_events: usize,
     default_enabled: bool,
-    use_transcripts: bool,
     auto_sync: bool,
     local_sync: bool,
     debug_mode: bool,
@@ -67,7 +65,7 @@ pub fn render(
     }
 
     // Split: settings info+actions on top, debug log on bottom (when enabled)
-    let settings_height = if debug_mode { 19u16 } else { 18u16 };
+    let settings_height = if debug_mode { 16u16 } else { 15u16 };
     let (settings_area, debug_area) = if debug_mode && !debug_lines.is_empty() {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -82,7 +80,6 @@ pub fn render(
     };
 
     let sync_mode = if default_enabled { "auto (all projects)" } else { "manual (whitelist)" };
-    let data_source = if use_transcripts { "transcripts (tokens)" } else { "hooks (events)" };
 
     let mut lines = vec![
         Line::from(""),
@@ -98,14 +95,6 @@ pub fn render(
             Span::styled("  Sync mode    ", theme::dim()),
             Span::styled(sync_mode, theme::text()),
         ]),
-        Line::from(vec![
-            Span::styled("  Data source  ", theme::dim()),
-            Span::styled(data_source, if use_transcripts { theme::accent() } else { theme::text() }),
-        ]),
-        Line::from(vec![
-            Span::styled("  Pending      ", theme::dim()),
-            Span::styled(format!("{pending_events} events"), theme::text()),
-        ]),
     ];
     if debug_mode {
         lines.push(Line::from(vec![
@@ -116,7 +105,6 @@ pub fn render(
     lines.push(Line::from(""));
 
     let auto_sync_label = if auto_sync { "Disable auto sync" } else { "Enable auto sync" };
-    let data_source_label = if use_transcripts { "Switch to hooks" } else { "Switch to transcripts" };
     let local_sync_label = if local_sync { "[DEV] Local sync: ON" } else { "[DEV] Local sync: OFF" };
     let debug_label = if debug_mode { "Debug Mode: ON" } else { "Debug Mode: OFF" };
     let actions = [
@@ -124,7 +112,6 @@ pub fn render(
         "Import History",
         auto_sync_label,
         if default_enabled { "Switch to manual mode" } else { "Switch to auto mode" },
-        data_source_label,
         local_sync_label,
         debug_label,
         "Logout",

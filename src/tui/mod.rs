@@ -19,8 +19,7 @@ use crossterm::{
 };
 use ratatui::prelude::*;
 
-use crate::config::{config_get, config_get_bool, config_get_bool_default, config_set, config_set_bool};
-use crate::paths::metrics_path;
+use crate::config::{config_get, config_get_bool, config_get_bool_default, config_set_bool};
 
 #[derive(Clone, Copy, PartialEq)]
 enum Tab {
@@ -65,7 +64,6 @@ struct App {
     should_quit: bool,
     user_name: String,
     connected: bool,
-    pending_events: usize,
     sessions_state: sessions::SessionsState,
     projects_state: projects::ProjectsState,
     settings_state: settings::SettingsState,
@@ -73,7 +71,6 @@ struct App {
     login_state: Option<crate::auth::LoginListener>,
     import_picker: Option<import_picker::ImportPickerState>,
     onboarding: Option<onboarding::OnboardingState>,
-    use_transcripts: bool,
     auto_sync: bool,
     local_sync: bool,
     debug_mode: bool,
@@ -85,9 +82,6 @@ impl App {
     fn new(dir: &Path) -> Self {
         let user_name = config_get(dir, "displayName").unwrap_or_else(|| "—".to_string());
         let connected = config_get(dir, "apiKey").is_some();
-        let pending_events = std::fs::read_to_string(metrics_path(dir))
-            .map(|c| c.lines().filter(|l| !l.trim().is_empty()).count())
-            .unwrap_or(0);
 
         let mut projects_state = projects::ProjectsState::default();
         projects_state.load(dir);
@@ -111,8 +105,6 @@ impl App {
             None
         };
 
-        let use_transcripts = config_get(dir, "syncSource")
-            .map(|s| s == "transcripts").unwrap_or(false);
         let auto_sync = config_get_bool_default(dir, "autoSync", true);
         let local_sync = config_get_bool(dir, "localSync");
         let debug_mode = config_get_bool(dir, "debugMode");
@@ -123,7 +115,6 @@ impl App {
             should_quit: false,
             user_name,
             connected,
-            pending_events,
             sessions_state: sessions::SessionsState::default(),
             projects_state,
             settings_state: settings::SettingsState::default(),
@@ -131,7 +122,6 @@ impl App {
             login_state: None,
             import_picker: None,
             onboarding,
-            use_transcripts,
             auto_sync,
             local_sync,
             debug_mode,
@@ -143,12 +133,7 @@ impl App {
     fn reload(&mut self) {
         self.user_name = config_get(&self.dir, "displayName").unwrap_or_else(|| "—".to_string());
         self.connected = config_get(&self.dir, "apiKey").is_some();
-        self.pending_events = std::fs::read_to_string(metrics_path(&self.dir))
-            .map(|c| c.lines().filter(|l| !l.trim().is_empty()).count())
-            .unwrap_or(0);
         self.projects_state.load(&self.dir);
-        self.use_transcripts = config_get(&self.dir, "syncSource")
-            .map(|s| s == "transcripts").unwrap_or(false);
         self.auto_sync = config_get_bool_default(&self.dir, "autoSync", true);
         self.debug_mode = config_get_bool(&self.dir, "debugMode");
     }
@@ -394,7 +379,7 @@ impl App {
         }
         match self.settings_state.selected {
             0 => {
-                let rc = crate::sync::cmd_sync(&self.dir);
+                let rc = crate::sync::cmd_sync_transcripts(&self.dir);
                 self.status_msg = if rc == 0 {
                     "Sync complete".into()
                 } else {
@@ -435,14 +420,6 @@ impl App {
                 }
             }
             4 => {
-                let new_source = if self.use_transcripts { "hooks" } else { "transcripts" };
-                if let Ok(()) = config_set(&self.dir, "syncSource", new_source) {
-                    self.use_transcripts = !self.use_transcripts;
-                    self.status_msg = format!("Data source: {new_source}");
-                    self.reload();
-                }
-            }
-            5 => {
                 let new_val = !self.local_sync;
                 if let Ok(()) = config_set_bool(&self.dir, "localSync", new_val) {
                     self.local_sync = new_val;
@@ -450,7 +427,7 @@ impl App {
                     self.status_msg = format!("Local sync {label}");
                 }
             }
-            6 => {
+            5 => {
                 let new_val = !self.debug_mode;
                 if let Ok(()) = config_set_bool(&self.dir, "debugMode", new_val) {
                     self.debug_mode = new_val;
@@ -464,7 +441,7 @@ impl App {
                     }
                 }
             }
-            7 => {
+            6 => {
                 crate::auth::cmd_logout(&self.dir);
                 self.status_msg = "Logged out".into();
                 self.reload();
@@ -701,7 +678,7 @@ pub fn run(dir: &Path) -> i32 {
                 Tab::Dashboard => dashboard::render(frame, layout[2]),
                 Tab::Sessions => sessions::render(frame, layout[2], &app.sessions_state),
                 Tab::Projects => projects::render(frame, layout[2], &mut app.projects_state),
-                Tab::Settings => settings::render(frame, layout[2], &app.settings_state, &app.user_name, app.connected, app.pending_events, app.projects_state.registry.default_enabled, app.use_transcripts, app.auto_sync, app.local_sync, app.debug_mode, &app.debug_log, &app.dir),
+                Tab::Settings => settings::render(frame, layout[2], &app.settings_state, &app.user_name, app.connected, app.projects_state.registry.default_enabled, app.auto_sync, app.local_sync, app.debug_mode, &app.debug_log, &app.dir),
             }
 
             if has_status {

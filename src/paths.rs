@@ -24,10 +24,6 @@ pub fn data_dir() -> PathBuf {
     dir
 }
 
-pub fn metrics_path(dir: &Path) -> PathBuf {
-    dir.join("metrics.jsonl")
-}
-
 pub fn config_path(dir: &Path) -> PathBuf {
     dir.join(".sync-config.json")
 }

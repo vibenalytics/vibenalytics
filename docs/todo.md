@@ -2,13 +2,16 @@
 
 Known issues and improvements for the sync pipeline.
 
-## Bugs
+## Done
+
+### Ghost prompt entries (orphan assistant data)
+- **Fixed:** 2s sleep in `log_cmd.rs` + `prompt_started` guard in `transcripts.rs`
+- Stop hook fires ~500ms before the final assistant message is flushed to the transcript. This caused "ghost" prompt entries with no `prompt_text` in nearly every sync.
+- Two-layer fix: sleep gives the transcript time to flush, and the parser skips PromptUsage entries before the first real user message in a sync window.
 
 ### prompt_index vs prompt_count mismatch
-- **Severity:** High
-- **Files:** `transcripts.rs`, `sync.rs`
-- The cursor stores `last_prompt_count` (real user prompts only) but uses it as `prompt_index_offset` (which should include compaction indices). After a compaction, prompt indices can collide because compaction increments `current_prompt_index` but not `session.prompt_count`.
-- **Fix:** Track the actual last `prompt_index` in the cursor instead of just the count of real prompts.
+- **Fixed:** `sync.rs` cursor now derives `last_prompt_count` from `max(prompt_index) + 1` instead of summing `session.prompt_count`.
+- The cursor stored `last_prompt_count` (real user prompts only) but used it as `prompt_index_offset` (which should include compaction indices). After a compaction, prompt indices could collide.
 
 ## Improvements
 

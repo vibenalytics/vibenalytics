@@ -71,10 +71,6 @@ enum Commands {
 
     /// Manually trigger a sync
     Sync {
-        /// Use transcript-based sync
-        #[arg(long)]
-        use_transcripts: bool,
-
         /// Force sync even if recently synced
         #[arg(long)]
         force: bool,
@@ -108,11 +104,7 @@ enum Commands {
 
     /// (internal) Hook handler — reads event JSON from stdin
     #[command(hide = true)]
-    Log {
-        /// Use transcript-based logging
-        #[arg(long)]
-        use_transcripts: bool,
-    },
+    Log,
 
     /// (debug) Parse a transcript file and print the payload JSON
     #[command(hide = true)]
@@ -174,7 +166,6 @@ enum SettingsAction {
 
 const SETTINGS_HELP: &[(&str, &str, &str)] = &[
     ("autoSync", "bool", "Auto-sync on boundary events (default: true)"),
-    ("syncSource", "string", "Sync source: 'transcripts' or 'hook' (default: transcripts)"),
     ("localSync", "bool", "[DEV] Sync to local files instead of backend (default: false)"),
     ("debugMode", "bool", "Write debug transcript dumps (default: false)"),
 ];
@@ -426,15 +417,8 @@ fn main() {
             sync::cmd_sync_dry(&dir, project.as_deref())
         }
 
-        Some(Commands::Sync { use_transcripts, .. }) => {
-            // Default is now transcripts unless explicitly using hooks
-            let use_hooks_config = config::config_get(&dir, "syncSource")
-                .map(|s| s == "hook").unwrap_or(false);
-            if use_transcripts || !use_hooks_config {
-                sync::cmd_sync_transcripts(&dir)
-            } else {
-                sync::cmd_sync(&dir)
-            }
+        Some(Commands::Sync { .. }) => {
+            sync::cmd_sync_transcripts(&dir)
         }
 
         Some(Commands::Import { project, dry }) => {
@@ -443,7 +427,7 @@ fn main() {
 
         Some(Commands::Update) => update::cmd_update(),
 
-        Some(Commands::Log { .. }) => {
+        Some(Commands::Log) => {
             log_cmd::cmd_log(&dir)
         }
 

@@ -270,7 +270,6 @@ interface SessionPayload {
     ended_at: string;                      // ISO 8601 UTC
     duration_seconds?: number;             // Computed from started_at/ended_at
     events: Record<string, number>;        // Hook event counts (empty for transcript sync)
-    tools: Record<string, number>;         // Tool call counts (e.g., {"Read": 5, "Edit": 3})
     prompt_count: number;                  // Real user prompts (excludes compaction)
     message_count: number;                 // Total transcript messages parsed
     permission_mode?: string;              // "default" | "acceptEdits" | ...
@@ -287,23 +286,8 @@ interface SessionPayload {
     total_turn_duration_ms?: number;
     turn_count?: number;
 
-    // Tool performance
-    tool_latencies?: ToolLatency[];
-    tool_response_sizes?: ToolResponseSize[];
-    parallel_tool_batches?: number;
-
-    // Permission requests
-    permission_requests?: PermissionStat[];
-
-    // Subagent totals
-    subagent_input_tokens?: number;
-    subagent_output_tokens?: number;
-
-    // Per-prompt breakdown
+    // Per-prompt breakdown (requests nested inside each prompt)
     prompts?: PromptPayload[];
-
-    // Per-request breakdown
-    requests?: RequestPayload[];
 }
 
 interface PromptPayload {
@@ -323,7 +307,6 @@ interface PromptPayload {
     request_count: number;                 // Number of API requests in this prompt
 
     // Optional fields
-    tools?: Record<string, number>;        // Tool calls within this prompt
     model?: string;                        // Model used
     prompt_text?: string;                  // First 500 chars of user message
     command?: string;                      // Slash command name (when type = "command")
@@ -332,6 +315,9 @@ interface PromptPayload {
     // Compaction metadata (when type = "compaction")
     compaction_trigger?: string;           // "auto" | "manual"
     compaction_pre_tokens?: number;        // Context size before compaction
+
+    // Nested per-request breakdown
+    requests?: RequestPayload[];           // Individual API requests in this prompt
 }
 
 interface RequestPayload {
@@ -344,29 +330,9 @@ interface RequestPayload {
     cache_read_tokens: number;
     cache_creation_tokens: number;
     is_subagent: boolean;                  // true if from a subagent process
-    prompt_index: number;                  // Links to parent PromptPayload
+    tools: Record<string, number>;          // Tool call counts in this request (e.g., {"Read": 2, "Edit": 1})
 }
 
-interface ToolLatency {
-    tool: string;
-    avg_ms: number;
-    min_ms: number;
-    max_ms: number;
-    count: number;
-}
-
-interface ToolResponseSize {
-    tool: string;
-    total_bytes: number;
-    avg_bytes: number;
-    count: number;
-}
-
-interface PermissionStat {
-    tool: string;
-    domain: string;
-    count: number;
-}
 ```
 
 ## Context growth pattern

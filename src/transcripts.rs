@@ -241,6 +241,7 @@ struct FullParseAccum {
     cache_creation_tokens: u64,
     seen_tool_use_ids: HashSet<String>,
     prompt_index: i32,
+    tools: HashMap<String, u32>,
 }
 
 pub fn parse_session_transcript(filepath: &Path, fallback_project: &str, fallback_path_hash: &str) -> Option<Session> {
@@ -335,6 +336,7 @@ pub fn parse_session_transcript(filepath: &Path, fallback_project: &str, fallbac
                     cache_creation_tokens: 0,
                     seen_tool_use_ids: HashSet::new(),
                     prompt_index: current_prompt_index.max(0),
+                    tools: HashMap::new(),
                 });
 
                 if !model.is_empty() {
@@ -365,10 +367,12 @@ pub fn parse_session_transcript(filepath: &Path, fallback_project: &str, fallbac
                                 let tool = block.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
                                 *session.tools.entry(tool.to_string()).or_insert(0) += 1;
                                 *current_prompt_tools.entry(tool.to_string()).or_insert(0) += 1;
+                                *accum.tools.entry(tool.to_string()).or_insert(0) += 1;
                             } else if tool_id.is_empty() {
                                 let tool = block.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
                                 *session.tools.entry(tool.to_string()).or_insert(0) += 1;
                                 *current_prompt_tools.entry(tool.to_string()).or_insert(0) += 1;
+                                *accum.tools.entry(tool.to_string()).or_insert(0) += 1;
                             }
                         }
                     }
@@ -549,6 +553,7 @@ pub fn parse_session_transcript(filepath: &Path, fallback_project: &str, fallbac
             cache_creation_tokens: accum.cache_creation_tokens,
             is_subagent: false,
             prompt_index: accum.prompt_index,
+            tools: accum.tools,
         });
     }
 
@@ -575,6 +580,7 @@ struct RequestAccum {
     cache_creation_tokens: u64,
     seen_tool_use_ids: HashSet<String>,
     prompt_index: i32,
+    tools: HashMap<String, u32>,
 }
 
 /// Returns (Session, new_byte_offset, last_request_id, last_message_id, last_output_tokens).
@@ -611,6 +617,7 @@ pub fn parse_transcript_from_offset(
     let mut current_prompt_type = String::new();
     let mut current_prompt_command = String::new();
     let mut pending_compaction: Option<(String, u64)> = None; // (trigger, pre_tokens)
+    let mut prompt_started = false; // true after first real user message or compaction
 
     for line_result in reader.lines() {
         let line = match line_result {
@@ -694,6 +701,7 @@ pub fn parse_transcript_from_offset(
                     cache_creation_tokens: 0,
                     seen_tool_use_ids: HashSet::new(),
                     prompt_index: current_prompt_index.max(0),
+                    tools: HashMap::new(),
                 });
 
                 if !model.is_empty() {
@@ -730,10 +738,12 @@ pub fn parse_transcript_from_offset(
                                 let tool = block.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
                                 *session.tools.entry(tool.to_string()).or_insert(0) += 1;
                                 *current_prompt_tools.entry(tool.to_string()).or_insert(0) += 1;
+                                *accum.tools.entry(tool.to_string()).or_insert(0) += 1;
                             } else if tool_id.is_empty() {
                                 let tool = block.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
                                 *session.tools.entry(tool.to_string()).or_insert(0) += 1;
                                 *current_prompt_tools.entry(tool.to_string()).or_insert(0) += 1;
+                                *accum.tools.entry(tool.to_string()).or_insert(0) += 1;
                             }
                         }
                     }
@@ -749,7 +759,7 @@ pub fn parse_transcript_from_offset(
                 let is_compact_summary = evt.get("isCompactSummary")
                     .and_then(|v| v.as_bool()).unwrap_or(false);
                 if is_compact_summary {
-                    if current_prompt_index >= 0 {
+                    if prompt_started && current_prompt_index >= 0 {
                         session.prompts.push(PromptUsage {
                             prompt_index: current_prompt_index,
                             timestamp: current_prompt_ts.clone(),
@@ -769,6 +779,7 @@ pub fn parse_transcript_from_offset(
                             context_tokens: 0,
                         });
                     }
+                    prompt_started = true;
                     current_prompt_index += 1;
                     current_prompt_tools.clear();
                     current_prompt_ts = evt.get("timestamp")
@@ -803,7 +814,7 @@ pub fn parse_transcript_from_offset(
                     .and_then(|v| v.as_str());
                 if let Some(text) = content_str {
                     if is_real_user_prompt(text) {
-                        if current_prompt_index >= 0 {
+                        if prompt_started && current_prompt_index >= 0 {
                             session.prompts.push(PromptUsage {
                                 prompt_index: current_prompt_index,
                                 timestamp: current_prompt_ts.clone(),
@@ -823,6 +834,7 @@ pub fn parse_transcript_from_offset(
                                 context_tokens: 0,
                             });
                         }
+                        prompt_started = true;
                         current_prompt_index += 1;
                         current_prompt_tools.clear();
                         current_prompt_ts = evt.get("timestamp")
@@ -870,8 +882,8 @@ pub fn parse_transcript_from_offset(
         }
     }
 
-    // Flush the last prompt
-    if current_prompt_index >= 0 {
+    // Flush the last prompt (only if a real user message or compaction was seen)
+    if prompt_started && current_prompt_index >= 0 {
         session.prompts.push(PromptUsage {
             prompt_index: current_prompt_index,
             timestamp: current_prompt_ts,
@@ -941,6 +953,7 @@ pub fn parse_transcript_from_offset(
             cache_creation_tokens: if is_boundary { 0 } else { accum.cache_creation_tokens },
             is_subagent: false,
             prompt_index: accum.prompt_index,
+            tools: accum.tools.clone(),
         });
     }
 
