@@ -2,7 +2,6 @@ mod theme;
 mod header;
 mod overlay;
 mod dashboard;
-mod sessions;
 mod projects;
 mod settings;
 mod import_picker;
@@ -23,8 +22,7 @@ use crate::config::{config_get, config_get_bool, config_get_bool_default, config
 
 #[derive(Clone, Copy, PartialEq)]
 enum Tab {
-    Dashboard,
-    Sessions,
+    Overview,
     Projects,
     Settings,
 }
@@ -32,25 +30,23 @@ enum Tab {
 impl Tab {
     fn index(self) -> usize {
         match self {
-            Tab::Dashboard => 0,
-            Tab::Sessions => 1,
-            Tab::Projects => 2,
-            Tab::Settings => 3,
+            Tab::Overview => 0,
+            Tab::Projects => 1,
+            Tab::Settings => 2,
         }
     }
 
     fn from_index(i: usize) -> Self {
         match i {
-            0 => Tab::Dashboard,
-            1 => Tab::Sessions,
-            2 => Tab::Projects,
-            3 => Tab::Settings,
-            _ => Tab::Dashboard,
+            0 => Tab::Overview,
+            1 => Tab::Projects,
+            2 => Tab::Settings,
+            _ => Tab::Overview,
         }
     }
 
     fn next(self) -> Self {
-        Tab::from_index((self.index() + 1).min(3))
+        Tab::from_index((self.index() + 1).min(2))
     }
 
     fn prev(self) -> Self {
@@ -64,7 +60,7 @@ struct App {
     should_quit: bool,
     user_name: String,
     connected: bool,
-    sessions_state: sessions::SessionsState,
+    dashboard_state: dashboard::DashboardState,
     projects_state: projects::ProjectsState,
     settings_state: settings::SettingsState,
     status_msg: String,
@@ -109,13 +105,27 @@ impl App {
         let local_sync = config_get_bool(dir, "localSync");
         let debug_mode = config_get_bool(dir, "debugMode");
 
+        let dashboard_state = if connected {
+            if let Some(key) = config_get(dir, "apiKey") {
+                let rx = dashboard::start_loading(&key);
+                dashboard::DashboardState {
+                    today: None,
+                    load_state: dashboard::LoadState::Loading { rx },
+                }
+            } else {
+                dashboard::DashboardState::default()
+            }
+        } else {
+            dashboard::DashboardState::default()
+        };
+
         App {
             dir: dir.to_path_buf(),
-            tab: Tab::Dashboard,
+            tab: Tab::Overview,
             should_quit: false,
             user_name,
             connected,
-            sessions_state: sessions::SessionsState::default(),
+            dashboard_state,
             projects_state,
             settings_state: settings::SettingsState::default(),
             status_msg: String::new(),
@@ -308,7 +318,6 @@ impl App {
             }
             KeyCode::Up => {
                 match self.tab {
-                    Tab::Sessions => self.sessions_state.up(),
                     Tab::Projects => self.projects_state.up(),
                     Tab::Settings => self.settings_state.up(),
                     _ => {}
@@ -316,7 +325,6 @@ impl App {
             }
             KeyCode::Down => {
                 match self.tab {
-                    Tab::Sessions => self.sessions_state.down(),
                     Tab::Projects => self.projects_state.down(),
                     Tab::Settings => self.settings_state.down(),
                     _ => {}
@@ -450,6 +458,10 @@ impl App {
         }
     }
 
+    fn poll_dashboard(&mut self) {
+        self.dashboard_state.poll();
+    }
+
     fn poll_import(&mut self) {
         if let Some(ref mut picker) = self.import_picker {
             let was_importing = matches!(&picker.phase, import_picker::ImportPhase::Importing { .. });
@@ -481,6 +493,10 @@ impl App {
                     }
                     self.login_state = None;
                     self.reload();
+
+                    // Trigger dashboard data fetch now that we have an API key
+                    let rx = dashboard::start_loading(&key);
+                    self.dashboard_state.load_state = dashboard::LoadState::Loading { rx };
 
                     // Trigger onboarding if not completed
                     let registry = crate::projects::read_projects(&self.dir);
@@ -535,6 +551,7 @@ pub fn run(dir: &Path) -> i32 {
         }
 
         app.poll_login();
+        app.poll_dashboard();
         app.poll_import();
 
         // Reload debug log periodically when viewing settings with debug on
@@ -675,8 +692,7 @@ pub fn run(dir: &Path) -> i32 {
             header::render_tab_bar(frame, layout[1], app.tab.index());
 
             match app.tab {
-                Tab::Dashboard => dashboard::render(frame, layout[2]),
-                Tab::Sessions => sessions::render(frame, layout[2], &app.sessions_state),
+                Tab::Overview => dashboard::render(frame, layout[2], &app.dashboard_state),
                 Tab::Projects => projects::render(frame, layout[2], &mut app.projects_state),
                 Tab::Settings => settings::render(frame, layout[2], &app.settings_state, &app.user_name, app.connected, app.projects_state.registry.default_enabled, app.auto_sync, app.local_sync, app.debug_mode, &app.debug_log, &app.dir),
             }
@@ -692,8 +708,7 @@ pub fn run(dir: &Path) -> i32 {
                 "esc cancel login"
             } else {
                 match app.tab {
-                    Tab::Dashboard => "←/→ tabs  esc quit",
-                    Tab::Sessions => "↑/↓ select  ←/→ tabs  esc quit",
+                    Tab::Overview => "←/→ tabs  esc quit",
                     Tab::Projects => if app.projects_state.has_changes() {
                         "↑/↓ navigate  space toggle  enter save  esc discard"
                     } else {

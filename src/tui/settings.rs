@@ -3,7 +3,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
 use super::theme;
 
-pub const ACTION_COUNT: usize = 6;
+pub const ACTION_COUNT: usize = 7;
 
 pub struct SettingsState {
     pub selected: usize,

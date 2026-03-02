@@ -107,10 +107,21 @@ pub fn poll_login(login: &LoginListener) -> Result<Option<(String, String)>, Str
     let api_key = params.get("key").cloned().unwrap_or_default();
     let user_name = params.get("name").cloned().unwrap_or_else(|| "user".to_string());
 
-    let html = r#"<!DOCTYPE html><html><head><meta charset="utf-8"><title>Vibenalytics</title>
-<style>body{font-family:system-ui;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;background:#1a1a2e;color:#e0e0e0}
-.card{text-align:center;padding:2rem;border-radius:12px;background:#252540;border:1px solid #333}.ok{color:#c97856;font-size:1.5rem;margin-bottom:0.5rem}</style>
-</head><body><div class="card"><div class="ok">CLI Authorized!</div><p>You can close this tab and return to your terminal.</p></div></body></html>"#;
+    let html = concat!(
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Vibenalytics</title>",
+        "<link rel=\"preconnect\" href=\"https://fonts.googleapis.com\">",
+        "<link rel=\"preconnect\" href=\"https://fonts.gstatic.com\" crossorigin>",
+        "<link href=\"https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600&display=swap\" rel=\"stylesheet\">",
+        "<style>",
+        "*{margin:0;padding:0;box-sizing:border-box}",
+        "body{font-family:'Plus Jakarta Sans',system-ui,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;background:#111113;color:#ededf0}",
+        ".card{text-align:center;padding:2.5rem 3rem;border-radius:0.875rem;background:#1a1a1e;border:1px solid #262630}",
+        ".ok{color:#cc8b65;font-size:1.1rem;font-weight:600;margin-bottom:0.5rem}",
+        "p{color:#8e8e9a;font-size:0.85rem}",
+        "</style>",
+        "</head><body><div class=\"card\"><div class=\"ok\">CLI Authorized</div>",
+        "<p>You can close this tab and return to your terminal.</p></div></body></html>",
+    );
 
     let response = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -128,6 +139,9 @@ pub fn poll_login(login: &LoginListener) -> Result<Option<(String, String)>, Str
 }
 
 /// Save login credentials to config.
+// TODO: handle syncing between user sessions somehow — currently this overwrites the
+// entire config, destroying autoSync/localSync/debugMode and any runtime apiBase override.
+// Should read existing config first and merge only the auth fields.
 pub fn save_login(dir: &Path, api_key: &str, display_name: &str) -> Result<(), String> {
     let cfg = json!({
         "apiKey": api_key,

@@ -2,7 +2,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::*;
 use super::theme;
 
-pub const TAB_NAMES: &[&str] = &["Overview", "Sessions", "Projects", "Settings"];
+pub const TAB_NAMES: &[&str] = &["Overview", "Projects", "Settings"];
 
 pub fn render_header(frame: &mut Frame, area: Rect, user_name: &str, connected: bool) {
     // Split into: blank line | header content

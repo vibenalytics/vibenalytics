@@ -31,22 +31,9 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    /// Verbose output (repeat for more: -vv, -vvv)
-    #[arg(short, long, action = clap::ArgAction::Count, global = true)]
-    verbose: u8,
-
-    /// Suppress non-error output
-    #[arg(short, long, global = true)]
-    quiet: bool,
-
-    /// Disable colored output
-    #[arg(long, global = true)]
-    no_color: bool,
-
     /// Machine-readable JSON output
     #[arg(long, global = true)]
     json: bool,
-
 }
 
 #[derive(Subcommand)]
@@ -417,6 +404,7 @@ fn main() {
             sync::cmd_sync_dry(&dir, project.as_deref())
         }
 
+        // TODO: pass `force` and `project` to cmd_sync_transcripts
         Some(Commands::Sync { .. }) => {
             sync::cmd_sync_transcripts(&dir)
         }

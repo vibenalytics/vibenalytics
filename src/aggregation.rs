@@ -13,6 +13,8 @@ pub struct RequestUsage {
     pub is_subagent: bool,
     pub prompt_index: i32,
     pub tools: HashMap<String, u32>,
+    pub lines_added: u64,
+    pub lines_removed: u64,
 }
 
 pub struct PromptUsage {
@@ -28,24 +30,53 @@ pub struct PromptUsage {
     pub prompt_text: String,
     pub msg_type: String,
     pub command: String,
+    pub skills: Vec<String>,
     pub subagent_count: u32,
     pub compaction_trigger: String,
     pub compaction_pre_tokens: u64,
     pub context_tokens: u64,
 }
 
-pub fn classify_prompt(text: &str) -> (String, String) {
+const BUILTIN_COMMANDS: &[&str] = &[
+    "/compact", "/clear", "/exit", "/help", "/login", "/logout",
+    "/config", "/model", "/resume", "/copy", "/debug", "/mcp",
+    "/plugin", "/context", "/init", "/rate-limit-options",
+    "/remote-env", "/extra-usage", "/passes",
+];
+
+/// Returns (msg_type, command, skills).
+/// - Built-in commands: ("command", "/compact", [])
+/// - Skill invocations: ("prompt", "", ["/frontend-design"])
+/// - Mixed prompt with skill: ("prompt", "", ["/frontend-design"])
+/// - Regular prompt: ("prompt", "", [])
+pub fn classify_prompt(text: &str) -> (String, String, Vec<String>) {
     let trimmed = text.trim_start();
-    if trimmed.starts_with("<command-name>") {
-        let cmd = trimmed
-            .strip_prefix("<command-name>")
-            .and_then(|s| s.split("</command-name>").next())
-            .unwrap_or("")
-            .to_string();
-        ("command".to_string(), cmd)
-    } else {
-        ("prompt".to_string(), String::new())
+
+    let cmd = extract_command_name(trimmed);
+
+    if cmd.is_empty() {
+        return ("prompt".to_string(), String::new(), Vec::new());
     }
+
+    let is_pure_command = trimmed.starts_with("<command-name>")
+        || trimmed.starts_with("<command-message>");
+
+    if is_pure_command && BUILTIN_COMMANDS.contains(&cmd.as_str()) {
+        ("command".to_string(), cmd, Vec::new())
+    } else {
+        // Skill invocation (standalone or inline) - it's a prompt with skill metadata
+        ("prompt".to_string(), String::new(), vec![cmd])
+    }
+}
+
+fn extract_command_name(text: &str) -> String {
+    if let Some(start) = text.find("<command-name>") {
+        let after = &text[start + "<command-name>".len()..];
+        if let Some(end) = after.find("</command-name>") {
+            return after[..end].to_string();
+        }
+    }
+    String::new()
 }
 
 pub struct Session {
@@ -71,6 +102,8 @@ pub struct Session {
     pub claude_version: String,
     pub requests: Vec<RequestUsage>,
     pub prompts: Vec<PromptUsage>,
+    pub total_lines_added: u64,
+    pub total_lines_removed: u64,
 }
 
 impl crate::projects::HasProjectHash for Session {
@@ -104,6 +137,8 @@ impl Session {
             claude_version: String::new(),
             requests: Vec::new(),
             prompts: Vec::new(),
+            total_lines_added: 0,
+            total_lines_removed: 0,
         }
     }
 }
@@ -133,6 +168,7 @@ pub fn build_prompts(session: &Session) -> Vec<PromptUsage> {
             prompt_text: String::new(),
             msg_type: String::new(),
             command: String::new(),
+            skills: Vec::new(),
             subagent_count: 0,
             compaction_trigger: String::new(),
             compaction_pre_tokens: 0,
@@ -170,6 +206,7 @@ pub fn build_prompts(session: &Session) -> Vec<PromptUsage> {
             prompt_text: String::new(),
             msg_type: String::new(),
             command: String::new(),
+            skills: Vec::new(),
             subagent_count: 0,
             compaction_trigger: String::new(),
             compaction_pre_tokens: 0,
@@ -186,6 +223,11 @@ pub fn build_prompts(session: &Session) -> Vec<PromptUsage> {
         }
         if !prompt.command.is_empty() {
             p.command = prompt.command.clone();
+        }
+        for skill in &prompt.skills {
+            if !p.skills.contains(skill) {
+                p.skills.push(skill.clone());
+            }
         }
         if prompt.subagent_count > 0 {
             p.subagent_count += prompt.subagent_count;
@@ -244,6 +286,8 @@ pub fn build_payload(sessions: &[Session]) -> Value {
             if !s.claude_version.is_empty() {
                 obj["claude_version"] = json!(s.claude_version);
             }
+            obj["total_lines_added"] = json!(s.total_lines_added);
+            obj["total_lines_removed"] = json!(s.total_lines_removed);
             if !s.requests.is_empty() {
                 // Group requests by prompt_index for nesting inside prompts
                 let mut requests_by_prompt: HashMap<i32, Vec<&RequestUsage>> = HashMap::new();
@@ -269,6 +313,9 @@ pub fn build_payload(sessions: &[Session]) -> Value {
                         if !p.command.is_empty() {
                             pobj["command"] = json!(p.command);
                         }
+                        if !p.skills.is_empty() {
+                            pobj["skills"] = json!(p.skills);
+                        }
                         if !p.model.is_empty() {
                             pobj["model"] = json!(p.model);
                         }
@@ -284,7 +331,7 @@ pub fn build_payload(sessions: &[Session]) -> Value {
                         }
                         if let Some(reqs) = requests_by_prompt.get(&p.prompt_index) {
                             pobj["requests"] = json!(reqs.iter().map(|r| {
-                                json!({
+                                let mut robj = json!({
                                     "request_id": r.request_id,
                                     "message_id": r.message_id,
                                     "timestamp": r.timestamp,
@@ -295,7 +342,10 @@ pub fn build_payload(sessions: &[Session]) -> Value {
                                     "cache_creation_tokens": r.cache_creation_tokens,
                                     "is_subagent": r.is_subagent,
                                     "tools": r.tools,
-                                })
+                                });
+                                robj["lines_added"] = json!(r.lines_added);
+                                robj["lines_removed"] = json!(r.lines_removed);
+                                robj
                             }).collect::<Vec<_>>());
                         }
                         pobj

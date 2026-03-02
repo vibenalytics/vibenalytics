@@ -228,6 +228,29 @@ fn is_real_user_prompt(content: &str) -> bool {
         && !content.starts_with("/plugin")
 }
 
+// ---- Patch line counting ----
+
+/// Count added/removed lines from a structuredPatch array.
+/// Each hunk has a "lines" array with "+"/"-"/" " prefixed strings.
+fn count_patch_lines(patches: &[Value]) -> (u64, u64) {
+    let mut added = 0u64;
+    let mut removed = 0u64;
+    for hunk in patches {
+        if let Some(lines) = hunk.get("lines").and_then(|v| v.as_array()) {
+            for line in lines {
+                if let Some(s) = line.as_str() {
+                    if s.starts_with('+') {
+                        added += 1;
+                    } else if s.starts_with('-') {
+                        removed += 1;
+                    }
+                }
+            }
+        }
+    }
+    (added, removed)
+}
+
 // ---- Full transcript parsing ----
 
 struct FullParseAccum {
@@ -242,6 +265,8 @@ struct FullParseAccum {
     seen_tool_use_ids: HashSet<String>,
     prompt_index: i32,
     tools: HashMap<String, u32>,
+    lines_added: u64,
+    lines_removed: u64,
 }
 
 pub fn parse_session_transcript(filepath: &Path, fallback_project: &str, fallback_path_hash: &str) -> Option<Session> {
@@ -252,6 +277,7 @@ pub fn parse_session_transcript(filepath: &Path, fallback_project: &str, fallbac
     session.project = fallback_project.to_string();
 
     let mut accum_map: HashMap<String, FullParseAccum> = HashMap::new();
+    let mut tool_use_to_request: HashMap<String, String> = HashMap::new();
     let mut seen_user_messages: HashSet<String> = HashSet::new();
     let mut current_prompt_index: i32 = -1;
     let mut current_prompt_tools: HashMap<String, u32> = HashMap::new();
@@ -259,6 +285,7 @@ pub fn parse_session_transcript(filepath: &Path, fallback_project: &str, fallbac
     let mut current_prompt_text = String::new();
     let mut current_prompt_type = String::new();
     let mut current_prompt_command = String::new();
+    let mut current_prompt_skills: Vec<String> = Vec::new();
     let mut pending_compaction: Option<(String, u64)> = None; // (trigger, pre_tokens)
 
     for line_result in reader.lines() {
@@ -325,6 +352,7 @@ pub fn parse_session_transcript(filepath: &Path, fallback_project: &str, fallbac
                     session.message_count += 1;
                 }
 
+                let key_clone = key.clone();
                 let accum = accum_map.entry(key).or_insert_with(|| FullParseAccum {
                     message_id: message_id.clone(),
                     request_id: request_id.clone(),
@@ -337,6 +365,8 @@ pub fn parse_session_transcript(filepath: &Path, fallback_project: &str, fallbac
                     seen_tool_use_ids: HashSet::new(),
                     prompt_index: current_prompt_index.max(0),
                     tools: HashMap::new(),
+                    lines_added: 0,
+                    lines_removed: 0,
                 });
 
                 if !model.is_empty() {
@@ -368,6 +398,7 @@ pub fn parse_session_transcript(filepath: &Path, fallback_project: &str, fallbac
                                 *session.tools.entry(tool.to_string()).or_insert(0) += 1;
                                 *current_prompt_tools.entry(tool.to_string()).or_insert(0) += 1;
                                 *accum.tools.entry(tool.to_string()).or_insert(0) += 1;
+                                tool_use_to_request.insert(tool_id.to_string(), key_clone.clone());
                             } else if tool_id.is_empty() {
                                 let tool = block.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
                                 *session.tools.entry(tool.to_string()).or_insert(0) += 1;
@@ -403,6 +434,7 @@ pub fn parse_session_transcript(filepath: &Path, fallback_project: &str, fallbac
                             prompt_text: std::mem::take(&mut current_prompt_text),
                             msg_type: std::mem::take(&mut current_prompt_type),
                             command: std::mem::take(&mut current_prompt_command),
+                            skills: std::mem::take(&mut current_prompt_skills),
                             subagent_count: 0,
                             compaction_trigger: String::new(),
                             compaction_pre_tokens: 0,
@@ -416,6 +448,7 @@ pub fn parse_session_transcript(filepath: &Path, fallback_project: &str, fallbac
                     current_prompt_text = String::new();
                     current_prompt_type = "compaction".to_string();
                     current_prompt_command = String::new();
+                    current_prompt_skills = Vec::new();
                     // Attach compaction metadata from pending system event
                     if let Some((trigger, pre_tokens)) = pending_compaction.take() {
                         session.prompts.push(PromptUsage {
@@ -431,6 +464,7 @@ pub fn parse_session_transcript(filepath: &Path, fallback_project: &str, fallbac
                             prompt_text: String::new(),
                             msg_type: "compaction".to_string(),
                             command: String::new(),
+                            skills: Vec::new(),
                             subagent_count: 0,
                             compaction_trigger: trigger,
                             compaction_pre_tokens: pre_tokens,
@@ -459,6 +493,7 @@ pub fn parse_session_transcript(filepath: &Path, fallback_project: &str, fallbac
                                 prompt_text: std::mem::take(&mut current_prompt_text),
                                 msg_type: std::mem::take(&mut current_prompt_type),
                                 command: std::mem::take(&mut current_prompt_command),
+                                skills: std::mem::take(&mut current_prompt_skills),
                                 subagent_count: 0,
                                 compaction_trigger: String::new(),
                                 compaction_pre_tokens: 0,
@@ -470,9 +505,10 @@ pub fn parse_session_transcript(filepath: &Path, fallback_project: &str, fallbac
                         current_prompt_ts = evt.get("timestamp")
                             .and_then(|v| v.as_str()).unwrap_or("").to_string();
                         current_prompt_text = text.chars().take(500).collect();
-                        let (pt, pc) = classify_prompt(text);
+                        let (pt, pc, ps) = classify_prompt(text);
                         current_prompt_type = pt;
                         current_prompt_command = pc;
+                        current_prompt_skills = ps;
                         session.prompt_count += 1;
                     }
                 }
@@ -488,6 +524,26 @@ pub fn parse_session_transcript(filepath: &Path, fallback_project: &str, fallbac
                         }
                         if session.path_hash.is_empty() {
                             session.path_hash = hash_path(cwd);
+                        }
+                    }
+                }
+                // Extract lines added/removed from toolUseResult.structuredPatch
+                if let Some(patches) = evt.pointer("/toolUseResult/structuredPatch").and_then(|v| v.as_array()) {
+                    let (added, removed) = count_patch_lines(patches);
+                    if added > 0 || removed > 0 {
+                        // Find the tool_use_id from message.content to link back to the request
+                        let tool_use_id = evt.pointer("/message/content")
+                            .and_then(|v| v.as_array())
+                            .and_then(|arr| arr.iter().find_map(|b| {
+                                b.get("tool_use_id").and_then(|v| v.as_str())
+                            }));
+                        if let Some(tui) = tool_use_id {
+                            if let Some(req_key) = tool_use_to_request.get(tui) {
+                                if let Some(accum) = accum_map.get_mut(req_key) {
+                                    accum.lines_added += added;
+                                    accum.lines_removed += removed;
+                                }
+                            }
                         }
                     }
                 }
@@ -521,6 +577,7 @@ pub fn parse_session_transcript(filepath: &Path, fallback_project: &str, fallbac
             prompt_text: current_prompt_text,
             msg_type: current_prompt_type,
             command: current_prompt_command,
+            skills: current_prompt_skills,
             subagent_count: 0,
             compaction_trigger: String::new(),
             compaction_pre_tokens: 0,
@@ -542,6 +599,8 @@ pub fn parse_session_transcript(filepath: &Path, fallback_project: &str, fallbac
         session.total_output_tokens += accum.output_tokens;
         session.total_cache_read_tokens += accum.cache_read_tokens;
         session.total_cache_creation_tokens += accum.cache_creation_tokens;
+        session.total_lines_added += accum.lines_added;
+        session.total_lines_removed += accum.lines_removed;
         session.requests.push(RequestUsage {
             request_id: accum.request_id,
             message_id: accum.message_id,
@@ -554,6 +613,8 @@ pub fn parse_session_transcript(filepath: &Path, fallback_project: &str, fallbac
             is_subagent: false,
             prompt_index: accum.prompt_index,
             tools: accum.tools,
+            lines_added: accum.lines_added,
+            lines_removed: accum.lines_removed,
         });
     }
 
@@ -581,6 +642,8 @@ struct RequestAccum {
     seen_tool_use_ids: HashSet<String>,
     prompt_index: i32,
     tools: HashMap<String, u32>,
+    lines_added: u64,
+    lines_removed: u64,
 }
 
 /// Returns (Session, new_byte_offset, last_request_id, last_message_id, last_output_tokens).
@@ -605,6 +668,7 @@ pub fn parse_transcript_from_offset(
     session.project = fallback_project.to_string();
 
     let mut accum_map: HashMap<String, RequestAccum> = HashMap::new();
+    let mut tool_use_to_request: HashMap<String, String> = HashMap::new();
     let mut last_request_id = String::new();
     let mut last_message_id = String::new();
     let mut current_offset = start_offset;
@@ -616,6 +680,7 @@ pub fn parse_transcript_from_offset(
     let mut current_prompt_text = String::new();
     let mut current_prompt_type = String::new();
     let mut current_prompt_command = String::new();
+    let mut current_prompt_skills: Vec<String> = Vec::new();
     let mut pending_compaction: Option<(String, u64)> = None; // (trigger, pre_tokens)
     let mut prompt_started = false; // true after first real user message or compaction
 
@@ -690,6 +755,7 @@ pub fn parse_transcript_from_offset(
                     session.message_count += 1;
                 }
 
+                let key_clone = key.clone();
                 let accum = accum_map.entry(key).or_insert_with(|| RequestAccum {
                     request_id: request_id.clone(),
                     message_id: message_id.clone(),
@@ -702,6 +768,8 @@ pub fn parse_transcript_from_offset(
                     seen_tool_use_ids: HashSet::new(),
                     prompt_index: current_prompt_index.max(0),
                     tools: HashMap::new(),
+                    lines_added: 0,
+                    lines_removed: 0,
                 });
 
                 if !model.is_empty() {
@@ -739,6 +807,7 @@ pub fn parse_transcript_from_offset(
                                 *session.tools.entry(tool.to_string()).or_insert(0) += 1;
                                 *current_prompt_tools.entry(tool.to_string()).or_insert(0) += 1;
                                 *accum.tools.entry(tool.to_string()).or_insert(0) += 1;
+                                tool_use_to_request.insert(tool_id.to_string(), key_clone.clone());
                             } else if tool_id.is_empty() {
                                 let tool = block.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
                                 *session.tools.entry(tool.to_string()).or_insert(0) += 1;
@@ -773,6 +842,7 @@ pub fn parse_transcript_from_offset(
                             prompt_text: std::mem::take(&mut current_prompt_text),
                             msg_type: std::mem::take(&mut current_prompt_type),
                             command: std::mem::take(&mut current_prompt_command),
+                            skills: std::mem::take(&mut current_prompt_skills),
                             subagent_count: 0,
                             compaction_trigger: String::new(),
                             compaction_pre_tokens: 0,
@@ -787,6 +857,7 @@ pub fn parse_transcript_from_offset(
                     current_prompt_text = String::new();
                     current_prompt_type = "compaction".to_string();
                     current_prompt_command = String::new();
+                    current_prompt_skills = Vec::new();
                     if let Some((trigger, pre_tokens)) = pending_compaction.take() {
                         session.prompts.push(PromptUsage {
                             prompt_index: current_prompt_index,
@@ -801,6 +872,7 @@ pub fn parse_transcript_from_offset(
                             prompt_text: String::new(),
                             msg_type: "compaction".to_string(),
                             command: String::new(),
+                            skills: Vec::new(),
                             subagent_count: 0,
                             compaction_trigger: trigger,
                             compaction_pre_tokens: pre_tokens,
@@ -828,6 +900,7 @@ pub fn parse_transcript_from_offset(
                                 prompt_text: std::mem::take(&mut current_prompt_text),
                                 msg_type: std::mem::take(&mut current_prompt_type),
                                 command: std::mem::take(&mut current_prompt_command),
+                                skills: std::mem::take(&mut current_prompt_skills),
                                 subagent_count: 0,
                                 compaction_trigger: String::new(),
                                 compaction_pre_tokens: 0,
@@ -840,9 +913,10 @@ pub fn parse_transcript_from_offset(
                         current_prompt_ts = evt.get("timestamp")
                             .and_then(|v| v.as_str()).unwrap_or("").to_string();
                         current_prompt_text = text.chars().take(500).collect();
-                        let (pt, pc) = classify_prompt(text);
+                        let (pt, pc, ps) = classify_prompt(text);
                         current_prompt_type = pt;
                         current_prompt_command = pc;
+                        current_prompt_skills = ps;
                         session.prompt_count += 1;
                     }
                 }
@@ -858,6 +932,25 @@ pub fn parse_transcript_from_offset(
                         }
                         if session.path_hash.is_empty() {
                             session.path_hash = hash_path(cwd);
+                        }
+                    }
+                }
+                // Extract lines added/removed from toolUseResult.structuredPatch
+                if let Some(patches) = evt.pointer("/toolUseResult/structuredPatch").and_then(|v| v.as_array()) {
+                    let (added, removed) = count_patch_lines(patches);
+                    if added > 0 || removed > 0 {
+                        let tool_use_id = evt.pointer("/message/content")
+                            .and_then(|v| v.as_array())
+                            .and_then(|arr| arr.iter().find_map(|b| {
+                                b.get("tool_use_id").and_then(|v| v.as_str())
+                            }));
+                        if let Some(tui) = tool_use_id {
+                            if let Some(req_key) = tool_use_to_request.get(tui) {
+                                if let Some(accum) = accum_map.get_mut(req_key) {
+                                    accum.lines_added += added;
+                                    accum.lines_removed += removed;
+                                }
+                            }
                         }
                     }
                 }
@@ -897,6 +990,7 @@ pub fn parse_transcript_from_offset(
             prompt_text: current_prompt_text,
             msg_type: current_prompt_type,
             command: current_prompt_command,
+            skills: current_prompt_skills,
             subagent_count: 0,
             compaction_trigger: String::new(),
             compaction_pre_tokens: 0,
@@ -941,6 +1035,8 @@ pub fn parse_transcript_from_offset(
             session.total_cache_creation_tokens += accum.cache_creation_tokens;
         }
         session.total_output_tokens += out;
+        session.total_lines_added += accum.lines_added;
+        session.total_lines_removed += accum.lines_removed;
 
         session.requests.push(RequestUsage {
             request_id: accum.request_id.clone(),
@@ -954,6 +1050,8 @@ pub fn parse_transcript_from_offset(
             is_subagent: false,
             prompt_index: accum.prompt_index,
             tools: accum.tools.clone(),
+            lines_added: accum.lines_added,
+            lines_removed: accum.lines_removed,
         });
     }
 
@@ -1026,6 +1124,8 @@ pub fn merge_subagent_sessions(parent: &mut Session, subagent: Session) {
         parent.total_output_tokens += req.output_tokens;
         parent.total_cache_read_tokens += req.cache_read_tokens;
         parent.total_cache_creation_tokens += req.cache_creation_tokens;
+        parent.total_lines_added += req.lines_added;
+        parent.total_lines_removed += req.lines_removed;
         parent.requests.push(req);
     }
 
