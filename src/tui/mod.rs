@@ -67,6 +67,7 @@ struct App {
     login_state: Option<crate::auth::LoginListener>,
     import_picker: Option<import_picker::ImportPickerState>,
     onboarding: Option<onboarding::OnboardingState>,
+    login_cursor: usize, // 0 = Login, 1 = Create account
     auto_sync: bool,
     local_sync: bool,
     debug_mode: bool,
@@ -132,6 +133,7 @@ impl App {
             login_state: None,
             import_picker: None,
             onboarding,
+            login_cursor: 0,
             auto_sync,
             local_sync,
             debug_mode,
@@ -291,10 +293,19 @@ impl App {
             return;
         }
 
-        // Not logged in — only allow login or quit
+        // Not logged in — login or create account
         if !self.connected {
             match key {
-                KeyCode::Enter => self.start_login(),
+                KeyCode::Up => { self.login_cursor = 0; }
+                KeyCode::Down => { self.login_cursor = 1; }
+                KeyCode::Enter => {
+                    if self.login_cursor == 0 {
+                        self.start_login();
+                    } else {
+                        let _ = open::that("https://app.vibenalytics.dev/register");
+                        self.status_msg = "Opening browser to create account...".into();
+                    }
+                }
                 KeyCode::Esc => { self.should_quit = true; }
                 _ => {}
             }
@@ -635,7 +646,8 @@ pub fn run(dir: &Path) -> i32 {
 
                 header::render_header(frame, layout[0], &app.user_name, app.connected);
 
-                let lines = vec![
+                let options = ["Login", "Create account"];
+                let mut lines = vec![
                     Line::from(""),
                     Line::from(""),
                     Line::from(Span::styled("  Welcome to Vibenalytics", theme::text())),
@@ -643,11 +655,19 @@ pub fn run(dir: &Path) -> i32 {
                     Line::from(Span::styled("  Log in to start tracking your Claude Code usage.", theme::dim())),
                     Line::from(""),
                     Line::from(""),
-                    Line::from(vec![
-                        Span::styled("  > ", theme::accent_bold()),
-                        Span::styled("Login", theme::accent_bold()),
-                    ]),
                 ];
+                for (i, label) in options.iter().enumerate() {
+                    let is_active = i == app.login_cursor;
+                    let (marker, style) = if is_active {
+                        ("> ", theme::accent_bold())
+                    } else {
+                        ("  ", theme::dim())
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("  {marker}"), style),
+                        Span::styled(*label, style),
+                    ]));
+                }
                 frame.render_widget(ratatui::widgets::Paragraph::new(lines), layout[1]);
 
                 if !app.status_msg.is_empty() {
@@ -660,7 +680,7 @@ pub fn run(dir: &Path) -> i32 {
                 let hints = if app.login_state.is_some() {
                     "esc cancel login"
                 } else {
-                    "enter login  esc quit"
+                    "↑/↓ select  enter confirm  esc quit"
                 };
                 header::render_footer(frame, layout[3], hints);
                 return;

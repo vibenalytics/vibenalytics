@@ -1,6 +1,15 @@
 use std::collections::HashMap;
 use serde_json::{json, Value};
 
+/// Helper to merge per-extension line counts into a target map.
+pub fn merge_extension_lines(target: &mut HashMap<String, (u64, u64)>, source: &HashMap<String, (u64, u64)>) {
+    for (ext, (a, r)) in source {
+        let entry = target.entry(ext.clone()).or_insert((0, 0));
+        entry.0 += a;
+        entry.1 += r;
+    }
+}
+
 pub struct RequestUsage {
     pub request_id: String,
     pub message_id: String,
@@ -15,6 +24,7 @@ pub struct RequestUsage {
     pub tools: HashMap<String, u32>,
     pub lines_added: u64,
     pub lines_removed: u64,
+    pub lines_by_extension: HashMap<String, (u64, u64)>,
 }
 
 pub struct PromptUsage {
@@ -27,7 +37,7 @@ pub struct PromptUsage {
     pub request_count: u32,
     pub tools: HashMap<String, u32>,
     pub model: String,
-    pub prompt_text: String,
+    pub prompt_length: usize,
     pub msg_type: String,
     pub command: String,
     pub skills: Vec<String>,
@@ -104,6 +114,7 @@ pub struct Session {
     pub prompts: Vec<PromptUsage>,
     pub total_lines_added: u64,
     pub total_lines_removed: u64,
+    pub total_lines_by_extension: HashMap<String, (u64, u64)>,
 }
 
 impl crate::projects::HasProjectHash for Session {
@@ -139,6 +150,7 @@ impl Session {
             prompts: Vec::new(),
             total_lines_added: 0,
             total_lines_removed: 0,
+            total_lines_by_extension: HashMap::new(),
         }
     }
 }
@@ -165,7 +177,7 @@ pub fn build_prompts(session: &Session) -> Vec<PromptUsage> {
             request_count: 0,
             tools: HashMap::new(),
             model: String::new(),
-            prompt_text: String::new(),
+            prompt_length: 0,
             msg_type: String::new(),
             command: String::new(),
             skills: Vec::new(),
@@ -203,7 +215,7 @@ pub fn build_prompts(session: &Session) -> Vec<PromptUsage> {
             request_count: 0,
             tools: HashMap::new(),
             model: String::new(),
-            prompt_text: String::new(),
+            prompt_length: 0,
             msg_type: String::new(),
             command: String::new(),
             skills: Vec::new(),
@@ -215,8 +227,8 @@ pub fn build_prompts(session: &Session) -> Vec<PromptUsage> {
         for (tool, count) in &prompt.tools {
             *p.tools.entry(tool.clone()).or_insert(0) += count;
         }
-        if !prompt.prompt_text.is_empty() {
-            p.prompt_text = prompt.prompt_text.clone();
+        if prompt.prompt_length > 0 {
+            p.prompt_length = prompt.prompt_length;
         }
         if !prompt.msg_type.is_empty() {
             p.msg_type = prompt.msg_type.clone();
@@ -288,6 +300,13 @@ pub fn build_payload(sessions: &[Session]) -> Value {
             }
             obj["total_lines_added"] = json!(s.total_lines_added);
             obj["total_lines_removed"] = json!(s.total_lines_removed);
+            if !s.total_lines_by_extension.is_empty() {
+                let ext_map: serde_json::Map<String, Value> = s.total_lines_by_extension.iter()
+                    .map(|(ext, (a, r))| (ext.clone(), json!({"added": a, "removed": r})))
+                    .collect();
+                obj["lines_by_extension"] = Value::Object(ext_map);
+            }
+            obj["cli_version"] = json!(env!("CARGO_PKG_VERSION"));
             if !s.requests.is_empty() {
                 // Group requests by prompt_index for nesting inside prompts
                 let mut requests_by_prompt: HashMap<i32, Vec<&RequestUsage>> = HashMap::new();
@@ -319,8 +338,8 @@ pub fn build_payload(sessions: &[Session]) -> Value {
                         if !p.model.is_empty() {
                             pobj["model"] = json!(p.model);
                         }
-                        if !p.prompt_text.is_empty() {
-                            pobj["prompt_text"] = json!(p.prompt_text);
+                        if p.prompt_length > 0 {
+                            pobj["prompt_length"] = json!(p.prompt_length);
                         }
                         if !p.compaction_trigger.is_empty() {
                             pobj["compaction_trigger"] = json!(p.compaction_trigger);
@@ -345,6 +364,12 @@ pub fn build_payload(sessions: &[Session]) -> Value {
                                 });
                                 robj["lines_added"] = json!(r.lines_added);
                                 robj["lines_removed"] = json!(r.lines_removed);
+                                if !r.lines_by_extension.is_empty() {
+                                    let ext_map: serde_json::Map<String, Value> = r.lines_by_extension.iter()
+                                        .map(|(ext, (a, rm))| (ext.clone(), json!({"added": a, "removed": rm})))
+                                        .collect();
+                                    robj["lines_by_extension"] = Value::Object(ext_map);
+                                }
                                 robj
                             }).collect::<Vec<_>>());
                         }

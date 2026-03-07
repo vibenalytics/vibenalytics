@@ -228,6 +228,14 @@ fn is_real_user_prompt(content: &str) -> bool {
         && !content.starts_with("/plugin")
 }
 
+/// Extract file extension from a path (e.g. "/foo/bar.rs" -> "rs", "Makefile" -> "").
+fn extract_extension(path: &str) -> String {
+    match path.rsplit('/').next().unwrap_or(path).rsplit_once('.') {
+        Some((_, ext)) if !ext.is_empty() && ext.len() <= 10 => ext.to_lowercase(),
+        _ => String::new(),
+    }
+}
+
 // ---- Patch line counting ----
 
 /// Count added/removed lines from a structuredPatch array.
@@ -267,6 +275,7 @@ struct FullParseAccum {
     tools: HashMap<String, u32>,
     lines_added: u64,
     lines_removed: u64,
+    lines_by_extension: HashMap<String, (u64, u64)>,
 }
 
 pub fn parse_session_transcript(filepath: &Path, fallback_project: &str, fallback_path_hash: &str) -> Option<Session> {
@@ -278,11 +287,13 @@ pub fn parse_session_transcript(filepath: &Path, fallback_project: &str, fallbac
 
     let mut accum_map: HashMap<String, FullParseAccum> = HashMap::new();
     let mut tool_use_to_request: HashMap<String, String> = HashMap::new();
+    let mut tool_use_to_extension: HashMap<String, String> = HashMap::new();
+    let mut write_lines_by_tool_id: HashMap<String, u64> = HashMap::new();
     let mut seen_user_messages: HashSet<String> = HashSet::new();
     let mut current_prompt_index: i32 = -1;
     let mut current_prompt_tools: HashMap<String, u32> = HashMap::new();
     let mut current_prompt_ts = String::new();
-    let mut current_prompt_text = String::new();
+    let mut current_prompt_length: usize = 0;
     let mut current_prompt_type = String::new();
     let mut current_prompt_command = String::new();
     let mut current_prompt_skills: Vec<String> = Vec::new();
@@ -367,6 +378,7 @@ pub fn parse_session_transcript(filepath: &Path, fallback_project: &str, fallbac
                     tools: HashMap::new(),
                     lines_added: 0,
                     lines_removed: 0,
+                    lines_by_extension: HashMap::new(),
                 });
 
                 if !model.is_empty() {
@@ -399,6 +411,35 @@ pub fn parse_session_transcript(filepath: &Path, fallback_project: &str, fallbac
                                 *current_prompt_tools.entry(tool.to_string()).or_insert(0) += 1;
                                 *accum.tools.entry(tool.to_string()).or_insert(0) += 1;
                                 tool_use_to_request.insert(tool_id.to_string(), key_clone.clone());
+                                // Track file extension for Write/Edit tools
+                                if tool == "Write" || tool == "Edit" {
+                                    if let Some(fp) = block.pointer("/input/file_path").and_then(|v| v.as_str()) {
+                                        let ext = extract_extension(fp);
+                                        if !ext.is_empty() {
+                                            tool_use_to_extension.insert(tool_id.to_string(), ext);
+                                        }
+                                    }
+                                }
+                                // For Write tool, count lines in the content being written
+                                if tool == "Write" {
+                                    if let Some(file_content) = block.pointer("/input/content").and_then(|v| v.as_str()) {
+                                        let line_count = if file_content.is_empty() { 0 } else {
+                                            file_content.lines().count() as u64
+                                        };
+                                        if line_count > 0 {
+                                            write_lines_by_tool_id.insert(tool_id.to_string(), line_count);
+                                        }
+                                    }
+                                }
+                                // Extract skill name from Skill tool invocations
+                                if tool == "Skill" {
+                                    if let Some(skill_name) = block.pointer("/input/skill").and_then(|v| v.as_str()) {
+                                        let formatted = format!("/{}", skill_name);
+                                        if !current_prompt_skills.contains(&formatted) {
+                                            current_prompt_skills.push(formatted);
+                                        }
+                                    }
+                                }
                             } else if tool_id.is_empty() {
                                 let tool = block.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
                                 *session.tools.entry(tool.to_string()).or_insert(0) += 1;
@@ -431,7 +472,7 @@ pub fn parse_session_transcript(filepath: &Path, fallback_project: &str, fallbac
                             request_count: 0,
                             tools: std::mem::take(&mut current_prompt_tools),
                             model: String::new(),
-                            prompt_text: std::mem::take(&mut current_prompt_text),
+                            prompt_length: std::mem::replace(&mut current_prompt_length, 0),
                             msg_type: std::mem::take(&mut current_prompt_type),
                             command: std::mem::take(&mut current_prompt_command),
                             skills: std::mem::take(&mut current_prompt_skills),
@@ -445,7 +486,7 @@ pub fn parse_session_transcript(filepath: &Path, fallback_project: &str, fallbac
                     current_prompt_tools.clear();
                     current_prompt_ts = evt.get("timestamp")
                         .and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    current_prompt_text = String::new();
+                    current_prompt_length = 0;
                     current_prompt_type = "compaction".to_string();
                     current_prompt_command = String::new();
                     current_prompt_skills = Vec::new();
@@ -461,7 +502,7 @@ pub fn parse_session_transcript(filepath: &Path, fallback_project: &str, fallbac
                             request_count: 0,
                             tools: HashMap::new(),
                             model: String::new(),
-                            prompt_text: String::new(),
+                            prompt_length: 0,
                             msg_type: "compaction".to_string(),
                             command: String::new(),
                             skills: Vec::new(),
@@ -490,7 +531,7 @@ pub fn parse_session_transcript(filepath: &Path, fallback_project: &str, fallbac
                                 request_count: 0,
                                 tools: std::mem::take(&mut current_prompt_tools),
                                 model: String::new(),
-                                prompt_text: std::mem::take(&mut current_prompt_text),
+                                prompt_length: std::mem::replace(&mut current_prompt_length, 0),
                                 msg_type: std::mem::take(&mut current_prompt_type),
                                 command: std::mem::take(&mut current_prompt_command),
                                 skills: std::mem::take(&mut current_prompt_skills),
@@ -504,7 +545,7 @@ pub fn parse_session_transcript(filepath: &Path, fallback_project: &str, fallbac
                         current_prompt_tools.clear();
                         current_prompt_ts = evt.get("timestamp")
                             .and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        current_prompt_text = text.chars().take(500).collect();
+                        current_prompt_length = text.len();
                         let (pt, pc, ps) = classify_prompt(text);
                         current_prompt_type = pt;
                         current_prompt_command = pc;
@@ -542,6 +583,34 @@ pub fn parse_session_transcript(filepath: &Path, fallback_project: &str, fallbac
                                 if let Some(accum) = accum_map.get_mut(req_key) {
                                     accum.lines_added += added;
                                     accum.lines_removed += removed;
+                                    if let Some(ext) = tool_use_to_extension.get(tui) {
+                                        let entry = accum.lines_by_extension.entry(ext.clone()).or_insert((0, 0));
+                                        entry.0 += added;
+                                        entry.1 += removed;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // For new file creation (Write with empty structuredPatch), count lines from tool input
+                let has_patch = evt.pointer("/toolUseResult/structuredPatch")
+                    .and_then(|v| v.as_array())
+                    .map_or(false, |a| !a.is_empty());
+                if !has_patch {
+                    if let Some(content) = evt.pointer("/message/content").and_then(|v| v.as_array()) {
+                        for block in content {
+                            if let Some(tui) = block.get("tool_use_id").and_then(|v| v.as_str()) {
+                                if let Some(wlines) = write_lines_by_tool_id.remove(tui) {
+                                    if let Some(req_key) = tool_use_to_request.get(tui) {
+                                        if let Some(accum) = accum_map.get_mut(req_key) {
+                                            accum.lines_added += wlines;
+                                            if let Some(ext) = tool_use_to_extension.get(tui) {
+                                                let entry = accum.lines_by_extension.entry(ext.clone()).or_insert((0, 0));
+                                                entry.0 += wlines;
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -574,7 +643,7 @@ pub fn parse_session_transcript(filepath: &Path, fallback_project: &str, fallbac
             request_count: 0,
             tools: current_prompt_tools,
             model: String::new(),
-            prompt_text: current_prompt_text,
+            prompt_length: current_prompt_length,
             msg_type: current_prompt_type,
             command: current_prompt_command,
             skills: current_prompt_skills,
@@ -601,6 +670,7 @@ pub fn parse_session_transcript(filepath: &Path, fallback_project: &str, fallbac
         session.total_cache_creation_tokens += accum.cache_creation_tokens;
         session.total_lines_added += accum.lines_added;
         session.total_lines_removed += accum.lines_removed;
+        crate::aggregation::merge_extension_lines(&mut session.total_lines_by_extension, &accum.lines_by_extension);
         session.requests.push(RequestUsage {
             request_id: accum.request_id,
             message_id: accum.message_id,
@@ -615,6 +685,7 @@ pub fn parse_session_transcript(filepath: &Path, fallback_project: &str, fallbac
             tools: accum.tools,
             lines_added: accum.lines_added,
             lines_removed: accum.lines_removed,
+            lines_by_extension: accum.lines_by_extension,
         });
     }
 
@@ -644,6 +715,7 @@ struct RequestAccum {
     tools: HashMap<String, u32>,
     lines_added: u64,
     lines_removed: u64,
+    lines_by_extension: HashMap<String, (u64, u64)>,
 }
 
 /// Returns (Session, new_byte_offset, last_request_id, last_message_id, last_output_tokens).
@@ -669,6 +741,8 @@ pub fn parse_transcript_from_offset(
 
     let mut accum_map: HashMap<String, RequestAccum> = HashMap::new();
     let mut tool_use_to_request: HashMap<String, String> = HashMap::new();
+    let mut tool_use_to_extension: HashMap<String, String> = HashMap::new();
+    let mut write_lines_by_tool_id: HashMap<String, u64> = HashMap::new();
     let mut last_request_id = String::new();
     let mut last_message_id = String::new();
     let mut current_offset = start_offset;
@@ -677,7 +751,7 @@ pub fn parse_transcript_from_offset(
     let mut current_prompt_index: i32 = prompt_index_offset - 1;
     let mut current_prompt_tools: HashMap<String, u32> = HashMap::new();
     let mut current_prompt_ts = String::new();
-    let mut current_prompt_text = String::new();
+    let mut current_prompt_length: usize = 0;
     let mut current_prompt_type = String::new();
     let mut current_prompt_command = String::new();
     let mut current_prompt_skills: Vec<String> = Vec::new();
@@ -770,6 +844,7 @@ pub fn parse_transcript_from_offset(
                     tools: HashMap::new(),
                     lines_added: 0,
                     lines_removed: 0,
+                    lines_by_extension: HashMap::new(),
                 });
 
                 if !model.is_empty() {
@@ -808,6 +883,35 @@ pub fn parse_transcript_from_offset(
                                 *current_prompt_tools.entry(tool.to_string()).or_insert(0) += 1;
                                 *accum.tools.entry(tool.to_string()).or_insert(0) += 1;
                                 tool_use_to_request.insert(tool_id.to_string(), key_clone.clone());
+                                // Track file extension for Write/Edit tools
+                                if tool == "Write" || tool == "Edit" {
+                                    if let Some(fp) = block.pointer("/input/file_path").and_then(|v| v.as_str()) {
+                                        let ext = extract_extension(fp);
+                                        if !ext.is_empty() {
+                                            tool_use_to_extension.insert(tool_id.to_string(), ext);
+                                        }
+                                    }
+                                }
+                                // For Write tool, count lines in the content being written
+                                if tool == "Write" {
+                                    if let Some(file_content) = block.pointer("/input/content").and_then(|v| v.as_str()) {
+                                        let line_count = if file_content.is_empty() { 0 } else {
+                                            file_content.lines().count() as u64
+                                        };
+                                        if line_count > 0 {
+                                            write_lines_by_tool_id.insert(tool_id.to_string(), line_count);
+                                        }
+                                    }
+                                }
+                                // Extract skill name from Skill tool invocations
+                                if tool == "Skill" {
+                                    if let Some(skill_name) = block.pointer("/input/skill").and_then(|v| v.as_str()) {
+                                        let formatted = format!("/{}", skill_name);
+                                        if !current_prompt_skills.contains(&formatted) {
+                                            current_prompt_skills.push(formatted);
+                                        }
+                                    }
+                                }
                             } else if tool_id.is_empty() {
                                 let tool = block.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
                                 *session.tools.entry(tool.to_string()).or_insert(0) += 1;
@@ -839,7 +943,7 @@ pub fn parse_transcript_from_offset(
                             request_count: 0,
                             tools: std::mem::take(&mut current_prompt_tools),
                             model: String::new(),
-                            prompt_text: std::mem::take(&mut current_prompt_text),
+                            prompt_length: std::mem::replace(&mut current_prompt_length, 0),
                             msg_type: std::mem::take(&mut current_prompt_type),
                             command: std::mem::take(&mut current_prompt_command),
                             skills: std::mem::take(&mut current_prompt_skills),
@@ -854,7 +958,7 @@ pub fn parse_transcript_from_offset(
                     current_prompt_tools.clear();
                     current_prompt_ts = evt.get("timestamp")
                         .and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    current_prompt_text = String::new();
+                    current_prompt_length = 0;
                     current_prompt_type = "compaction".to_string();
                     current_prompt_command = String::new();
                     current_prompt_skills = Vec::new();
@@ -869,7 +973,7 @@ pub fn parse_transcript_from_offset(
                             request_count: 0,
                             tools: HashMap::new(),
                             model: String::new(),
-                            prompt_text: String::new(),
+                            prompt_length: 0,
                             msg_type: "compaction".to_string(),
                             command: String::new(),
                             skills: Vec::new(),
@@ -897,7 +1001,7 @@ pub fn parse_transcript_from_offset(
                                 request_count: 0,
                                 tools: std::mem::take(&mut current_prompt_tools),
                                 model: String::new(),
-                                prompt_text: std::mem::take(&mut current_prompt_text),
+                                prompt_length: std::mem::replace(&mut current_prompt_length, 0),
                                 msg_type: std::mem::take(&mut current_prompt_type),
                                 command: std::mem::take(&mut current_prompt_command),
                                 skills: std::mem::take(&mut current_prompt_skills),
@@ -912,7 +1016,7 @@ pub fn parse_transcript_from_offset(
                         current_prompt_tools.clear();
                         current_prompt_ts = evt.get("timestamp")
                             .and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        current_prompt_text = text.chars().take(500).collect();
+                        current_prompt_length = text.len();
                         let (pt, pc, ps) = classify_prompt(text);
                         current_prompt_type = pt;
                         current_prompt_command = pc;
@@ -949,6 +1053,34 @@ pub fn parse_transcript_from_offset(
                                 if let Some(accum) = accum_map.get_mut(req_key) {
                                     accum.lines_added += added;
                                     accum.lines_removed += removed;
+                                    if let Some(ext) = tool_use_to_extension.get(tui) {
+                                        let entry = accum.lines_by_extension.entry(ext.clone()).or_insert((0, 0));
+                                        entry.0 += added;
+                                        entry.1 += removed;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // For new file creation (Write with empty structuredPatch), count lines from tool input
+                let has_patch = evt.pointer("/toolUseResult/structuredPatch")
+                    .and_then(|v| v.as_array())
+                    .map_or(false, |a| !a.is_empty());
+                if !has_patch {
+                    if let Some(content) = evt.pointer("/message/content").and_then(|v| v.as_array()) {
+                        for block in content {
+                            if let Some(tui) = block.get("tool_use_id").and_then(|v| v.as_str()) {
+                                if let Some(wlines) = write_lines_by_tool_id.remove(tui) {
+                                    if let Some(req_key) = tool_use_to_request.get(tui) {
+                                        if let Some(accum) = accum_map.get_mut(req_key) {
+                                            accum.lines_added += wlines;
+                                            if let Some(ext) = tool_use_to_extension.get(tui) {
+                                                let entry = accum.lines_by_extension.entry(ext.clone()).or_insert((0, 0));
+                                                entry.0 += wlines;
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -987,7 +1119,7 @@ pub fn parse_transcript_from_offset(
             request_count: 0,
             tools: current_prompt_tools,
             model: String::new(),
-            prompt_text: current_prompt_text,
+            prompt_length: current_prompt_length,
             msg_type: current_prompt_type,
             command: current_prompt_command,
             skills: current_prompt_skills,
@@ -1037,6 +1169,7 @@ pub fn parse_transcript_from_offset(
         session.total_output_tokens += out;
         session.total_lines_added += accum.lines_added;
         session.total_lines_removed += accum.lines_removed;
+        crate::aggregation::merge_extension_lines(&mut session.total_lines_by_extension, &accum.lines_by_extension);
 
         session.requests.push(RequestUsage {
             request_id: accum.request_id.clone(),
@@ -1052,6 +1185,7 @@ pub fn parse_transcript_from_offset(
             tools: accum.tools.clone(),
             lines_added: accum.lines_added,
             lines_removed: accum.lines_removed,
+            lines_by_extension: accum.lines_by_extension.clone(),
         });
     }
 
@@ -1126,6 +1260,7 @@ pub fn merge_subagent_sessions(parent: &mut Session, subagent: Session) {
         parent.total_cache_creation_tokens += req.cache_creation_tokens;
         parent.total_lines_added += req.lines_added;
         parent.total_lines_removed += req.lines_removed;
+        crate::aggregation::merge_extension_lines(&mut parent.total_lines_by_extension, &req.lines_by_extension);
         parent.requests.push(req);
     }
 

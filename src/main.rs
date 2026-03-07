@@ -25,7 +25,7 @@ use std::io::IsTerminal;
     name = "vibenalytics",
     about = "Claude Code usage analytics",
     version,
-    after_help = "EXAMPLES:\n    vibenalytics                    Launch the dashboard\n    vibenalytics init               First-time setup\n    vibenalytics project list       See tracked projects\n    vibenalytics import --dry       Preview history import\n\nDOCS:\n    https://docs.vibenalytics.dev"
+    after_help = "EXAMPLES:\n    vibenalytics                    Launch the dashboard\n    vibenalytics login              Authenticate via browser\n    vibenalytics project list       See tracked projects\n    vibenalytics import --dry       Preview history import\n\nDOCS:\n    https://docs.vibenalytics.dev"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -38,9 +38,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Set up Vibenalytics (scan projects, configure sync)
-    Init,
-
     /// Authenticate via browser
     Login,
 
@@ -172,7 +169,7 @@ fn cmd_status(dir: &std::path::Path, json_output: bool) -> i32 {
             if json_output {
                 println!(r#"{{"status":"not_configured"}}"#);
             } else {
-                println!("Not configured. Run: vibenalytics init");
+                println!("Not configured. Run: vibenalytics login");
             }
             return 1;
         }
@@ -321,13 +318,6 @@ fn main() {
             } else {
                 cmd_status(&dir, cli.json)
             }
-        }
-
-        Some(Commands::Init) => {
-            // TODO: Implement onboarding wizard (spec section 3)
-            eprintln!("TODO: Onboarding wizard not yet implemented.");
-            eprintln!("For now, use: vibenalytics login && vibenalytics project add");
-            1
         }
 
         Some(Commands::Login) => auth::cmd_login(&dir),

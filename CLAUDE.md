@@ -36,17 +36,17 @@ Cargo.toml        — Package config, dependencies, release profile
 ## Commands
 
 ```
-vibenalytics log [--use-transcripts]              Read hook JSON from stdin, strip content, append to metrics.jsonl
-vibenalytics sync [--use-transcripts]             Aggregate metrics.jsonl → POST to backend → flush
+vibenalytics                                      Launch TUI dashboard (or status if piped)
 vibenalytics login                                Browser-based login (opens browser, listens on localhost)
-vibenalytics login <email> <password>             Login with credentials → get JWT → generate API key
-vibenalytics login --api-key <key>                Set API key directly
+vibenalytics logout                               Clear stored credentials
 vibenalytics status                               Show configuration (API base, key, display name)
-vibenalytics aggregate <file>                     Dump aggregated JSON to stdout (debug)
-vibenalytics tui                                  Launch interactive TUI dashboard
-vibenalytics import-from-history [project] [--dry]  Parse ~/.claude/ transcripts → sync (--dry = JSONL only)
-vibenalytics project list|enable|disable|add      Manage project tracking
+vibenalytics sync [--force] [--dry] [project]     Aggregate transcripts → POST to backend
+vibenalytics import [project] [--dry]             Parse ~/.claude/ transcripts → sync (--dry = skip backend)
+vibenalytics project list|add|remove|enable|disable  Manage project tracking
+vibenalytics settings [list|get|set]              View or change settings (autoSync, localSync, debugMode)
 vibenalytics update                               Self-update to latest release
+vibenalytics log                                  (internal) Hook handler — reads event JSON from stdin
+vibenalytics parse-transcript <file>              (debug, hidden) Parse transcript and print payload JSON
 ```
 
 ## Build Configuration
