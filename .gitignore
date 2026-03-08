@@ -5,3 +5,4 @@ target/
 .sync-config.json
 sync.log
 CLAUDE.md
+docs/
