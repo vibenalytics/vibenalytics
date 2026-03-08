@@ -9,10 +9,9 @@ env:
   API_BASE: https://api.vibenalytics.dev/api
   FRONTEND_BASE: https://app.vibenalytics.dev
   APP_NAME: vibenalytics
-  PUBLIC_REPO: vibenalytics/vibenalytics-cli
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -105,13 +104,12 @@ jobs:
           echo '' >> checksums.json
           echo '}' >> checksums.json
 
-      - name: Create release on public repo
+      - name: Create release
         env:
-          GH_TOKEN: ${{ secrets.PUBLIC_RELEASE_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           VERSION="${GITHUB_REF_NAME}"
           gh release create "$VERSION" \
-            --repo "$PUBLIC_REPO" \
             --title "Vibenalytics CLI $VERSION" \
             --notes "Release $VERSION" \
             release/*

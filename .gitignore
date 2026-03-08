@@ -4,3 +4,4 @@ target/
 *.lock.json
 .sync-config.json
 sync.log
+CLAUDE.md

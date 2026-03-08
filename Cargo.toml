@@ -2,6 +2,13 @@
 name = "vibenalytics"
 version = "0.0.0-dev"
 edition = "2021"
+description = "Usage analytics CLI for Claude Code"
+license = "MIT"
+repository = "https://github.com/vibenalytics/vibenalytics"
+homepage = "https://vibenalytics.dev"
+readme = "README.md"
+keywords = ["claude-code", "analytics", "cli", "tui"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

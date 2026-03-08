@@ -145,8 +145,8 @@ GitHub Actions (`.github/workflows/release.yml`):
 - Sets `APP_NAME`, `API_BASE`, `FRONTEND_BASE` env vars for production build
 - Cross-compiles for 4 targets: darwin-arm64, darwin-x64, linux-x64, linux-arm64
 - Generates checksums.json
-- Publishes release assets to the **public** repo `vibenalytics/vibenalytics-cli`
-- Requires `PUBLIC_RELEASE_TOKEN` secret (PAT with `contents: write` on public repo)
+- Publishes release assets to this repo (`vibenalytics/vibenalytics`)
+- Uses default `GITHUB_TOKEN` (requires `contents: write` permission)
 
 ## Key Conventions
 

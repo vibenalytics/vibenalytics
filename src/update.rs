@@ -2,7 +2,7 @@ use std::fs;
 use std::io::Read;
 use std::process::{Command, Stdio};
 
-const REPO: &str = "vibenalytics/vibenalytics-cli";
+const REPO: &str = "vibenalytics/vibenalytics";
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn platform_artifact() -> Option<&'static str> {
@@ -18,7 +18,7 @@ fn platform_artifact() -> Option<&'static str> {
 fn fetch_latest_tag() -> Result<String, String> {
     let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
     let resp = ureq::get(&url)
-        .set("User-Agent", "vibenalytics-cli")
+        .set("User-Agent", "vibenalytics")
         .call()
         .map_err(|e| format!("Failed to check for updates: {e}"))?;
     let body: serde_json::Value = resp.into_json().map_err(|e| format!("Invalid response: {e}"))?;
@@ -35,7 +35,7 @@ fn download_and_extract(tag: &str, artifact: &str, dest: &std::path::Path) -> Re
     eprintln!("Downloading {artifact} {tag}...");
 
     let resp = ureq::get(&url)
-        .set("User-Agent", "vibenalytics-cli")
+        .set("User-Agent", "vibenalytics")
         .call()
         .map_err(|e| format!("Download failed: {e}"))?;
 
