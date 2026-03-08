@@ -600,7 +600,6 @@ pub fn dump_transcript_debug(dir: &Path) {
             "total_cache_creation_tokens": s.total_cache_creation_tokens,
             "total_turn_duration_ms": s.total_turn_duration_ms,
             "turn_count": s.turn_count,
-            "hostname": s.hostname,
             "permission_mode": s.permission_mode,
         })
     }).collect();

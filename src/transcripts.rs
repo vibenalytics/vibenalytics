@@ -689,13 +689,6 @@ pub fn parse_session_transcript(filepath: &Path, fallback_project: &str, fallbac
         });
     }
 
-    session.hostname = gethostname::gethostname()
-        .to_string_lossy()
-        .split('.')
-        .next()
-        .unwrap_or("unknown")
-        .to_string();
-
     Some(session)
 }
 
@@ -1188,13 +1181,6 @@ pub fn parse_transcript_from_offset(
             lines_by_extension: accum.lines_by_extension.clone(),
         });
     }
-
-    session.hostname = gethostname::gethostname()
-        .to_string_lossy()
-        .split('.')
-        .next()
-        .unwrap_or("unknown")
-        .to_string();
 
     let last_out = accum_map
         .values()
