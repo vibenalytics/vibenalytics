@@ -6,7 +6,11 @@
 
 # Vibenalytics
 
-Usage analytics for [Claude Code](https://docs.anthropic.com/en/docs/claude-code). Track token consumption, session activity, tool usage, and lines of code changed across all your projects.
+Persistent usage analytics for [Claude Code](https://docs.anthropic.com/en/docs/claude-code). Track token consumption, session activity, tool usage, and lines of code changed across all your projects.
+
+<p align="center">
+  <img src="assets/demo.gif" alt="Vibenalytics demo" width="720">
+</p>
 
 The source code is public so you can see exactly how the CLI works and what data is collected.
 
