@@ -110,6 +110,7 @@ jobs:
         run: |
           VERSION="${GITHUB_REF_NAME}"
           gh release create "$VERSION" \
+            --repo "${{ github.repository }}" \
             --title "Vibenalytics CLI $VERSION" \
             --notes "Release $VERSION" \
             release/*
