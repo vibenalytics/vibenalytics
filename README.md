@@ -258,6 +258,12 @@ src/
 | `vibenalytics-linux-x64` | Linux x64 |
 | `vibenalytics-linux-arm64` | Linux ARM64 |
 
+## Share your vibe
+
+Flex your stats. Drop this badge in your README to show the world how you vibe.
+
+[![Vibe Statistics](https://api.vibenalytics.dev/api/embed/86fff14f-18c1-4cfb-b0b2-0eb2b645fa44.svg)](https://vibenalytics.dev)
+
 ## Links
 
 - [Dashboard](https://app.vibenalytics.dev)
