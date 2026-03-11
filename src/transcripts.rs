@@ -215,6 +215,13 @@ pub fn find_subagent_files(parent_transcript: &Path) -> Vec<PathBuf> {
     }
     let mut results = Vec::new();
     collect_jsonl_recursive(&subagents_dir, &mut results);
+    // Filter out compact subagent files — these contain pre-compaction data
+    // that already exists in the parent transcript, so including them would
+    // double-count tokens and line changes.
+    results.retain(|p| {
+        let name = p.file_stem().unwrap_or_default().to_string_lossy();
+        !name.starts_with("agent-acompact")
+    });
     results
 }
 
@@ -289,6 +296,7 @@ pub fn parse_session_transcript(filepath: &Path, fallback_project: &str, fallbac
     let mut tool_use_to_request: HashMap<String, String> = HashMap::new();
     let mut tool_use_to_extension: HashMap<String, String> = HashMap::new();
     let mut write_lines_by_tool_id: HashMap<String, u64> = HashMap::new();
+    let mut edit_lines_by_tool_id: HashMap<String, (u64, u64)> = HashMap::new(); // (added, removed) from old_string/new_string
     let mut seen_user_messages: HashSet<String> = HashSet::new();
     let mut current_prompt_index: i32 = -1;
     let mut current_prompt_tools: HashMap<String, u32> = HashMap::new();
@@ -429,6 +437,21 @@ pub fn parse_session_transcript(filepath: &Path, fallback_project: &str, fallbac
                                         if line_count > 0 {
                                             write_lines_by_tool_id.insert(tool_id.to_string(), line_count);
                                         }
+                                    }
+                                }
+                                // For Edit tool, store old_string/new_string line counts as fallback
+                                // (subagent transcripts lack structuredPatch in tool results)
+                                if tool == "Edit" {
+                                    let old_lines = block.pointer("/input/old_string")
+                                        .and_then(|v| v.as_str())
+                                        .map(|s| if s.is_empty() { 0 } else { s.lines().count() as u64 })
+                                        .unwrap_or(0);
+                                    let new_lines = block.pointer("/input/new_string")
+                                        .and_then(|v| v.as_str())
+                                        .map(|s| if s.is_empty() { 0 } else { s.lines().count() as u64 })
+                                        .unwrap_or(0);
+                                    if new_lines > 0 || old_lines > 0 {
+                                        edit_lines_by_tool_id.insert(tool_id.to_string(), (new_lines, old_lines));
                                     }
                                 }
                                 // Extract skill name from Skill tool invocations
@@ -593,7 +616,8 @@ pub fn parse_session_transcript(filepath: &Path, fallback_project: &str, fallbac
                         }
                     }
                 }
-                // For new file creation (Write with empty structuredPatch), count lines from tool input
+                // For new file creation (Write with empty structuredPatch), count lines from tool input.
+                // Also apply Edit fallback when structuredPatch is absent (e.g. subagent transcripts).
                 let has_patch = evt.pointer("/toolUseResult/structuredPatch")
                     .and_then(|v| v.as_array())
                     .map_or(false, |a| !a.is_empty());
@@ -608,6 +632,20 @@ pub fn parse_session_transcript(filepath: &Path, fallback_project: &str, fallbac
                                             if let Some(ext) = tool_use_to_extension.get(tui) {
                                                 let entry = accum.lines_by_extension.entry(ext.clone()).or_insert((0, 0));
                                                 entry.0 += wlines;
+                                            }
+                                        }
+                                    }
+                                }
+                                // Edit fallback: use old_string/new_string line counts
+                                if let Some((added, removed)) = edit_lines_by_tool_id.remove(tui) {
+                                    if let Some(req_key) = tool_use_to_request.get(tui) {
+                                        if let Some(accum) = accum_map.get_mut(req_key) {
+                                            accum.lines_added += added;
+                                            accum.lines_removed += removed;
+                                            if let Some(ext) = tool_use_to_extension.get(tui) {
+                                                let entry = accum.lines_by_extension.entry(ext.clone()).or_insert((0, 0));
+                                                entry.0 += added;
+                                                entry.1 += removed;
                                             }
                                         }
                                     }
@@ -736,6 +774,7 @@ pub fn parse_transcript_from_offset(
     let mut tool_use_to_request: HashMap<String, String> = HashMap::new();
     let mut tool_use_to_extension: HashMap<String, String> = HashMap::new();
     let mut write_lines_by_tool_id: HashMap<String, u64> = HashMap::new();
+    let mut edit_lines_by_tool_id: HashMap<String, (u64, u64)> = HashMap::new(); // (added, removed) from old_string/new_string
     let mut last_request_id = String::new();
     let mut last_message_id = String::new();
     let mut current_offset = start_offset;
@@ -894,6 +933,21 @@ pub fn parse_transcript_from_offset(
                                         if line_count > 0 {
                                             write_lines_by_tool_id.insert(tool_id.to_string(), line_count);
                                         }
+                                    }
+                                }
+                                // For Edit tool, store old_string/new_string line counts as fallback
+                                // (subagent transcripts lack structuredPatch in tool results)
+                                if tool == "Edit" {
+                                    let old_lines = block.pointer("/input/old_string")
+                                        .and_then(|v| v.as_str())
+                                        .map(|s| if s.is_empty() { 0 } else { s.lines().count() as u64 })
+                                        .unwrap_or(0);
+                                    let new_lines = block.pointer("/input/new_string")
+                                        .and_then(|v| v.as_str())
+                                        .map(|s| if s.is_empty() { 0 } else { s.lines().count() as u64 })
+                                        .unwrap_or(0);
+                                    if new_lines > 0 || old_lines > 0 {
+                                        edit_lines_by_tool_id.insert(tool_id.to_string(), (new_lines, old_lines));
                                     }
                                 }
                                 // Extract skill name from Skill tool invocations
@@ -1056,7 +1110,8 @@ pub fn parse_transcript_from_offset(
                         }
                     }
                 }
-                // For new file creation (Write with empty structuredPatch), count lines from tool input
+                // For new file creation (Write with empty structuredPatch), count lines from tool input.
+                // Also apply Edit fallback when structuredPatch is absent (e.g. subagent transcripts).
                 let has_patch = evt.pointer("/toolUseResult/structuredPatch")
                     .and_then(|v| v.as_array())
                     .map_or(false, |a| !a.is_empty());
@@ -1071,6 +1126,20 @@ pub fn parse_transcript_from_offset(
                                             if let Some(ext) = tool_use_to_extension.get(tui) {
                                                 let entry = accum.lines_by_extension.entry(ext.clone()).or_insert((0, 0));
                                                 entry.0 += wlines;
+                                            }
+                                        }
+                                    }
+                                }
+                                // Edit fallback: use old_string/new_string line counts
+                                if let Some((added, removed)) = edit_lines_by_tool_id.remove(tui) {
+                                    if let Some(req_key) = tool_use_to_request.get(tui) {
+                                        if let Some(accum) = accum_map.get_mut(req_key) {
+                                            accum.lines_added += added;
+                                            accum.lines_removed += removed;
+                                            if let Some(ext) = tool_use_to_extension.get(tui) {
+                                                let entry = accum.lines_by_extension.entry(ext.clone()).or_insert((0, 0));
+                                                entry.0 += added;
+                                                entry.1 += removed;
                                             }
                                         }
                                     }

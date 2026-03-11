@@ -68,6 +68,7 @@ struct App {
     import_picker: Option<import_picker::ImportPickerState>,
     onboarding: Option<onboarding::OnboardingState>,
     login_cursor: usize, // 0 = Login, 1 = Create account
+    login_token_buf: String,
     auto_sync: bool,
     local_sync: bool,
     debug_mode: bool,
@@ -134,6 +135,7 @@ impl App {
             import_picker: None,
             onboarding,
             login_cursor: 0,
+            login_token_buf: String::new(),
             auto_sync,
             local_sync,
             debug_mode,
@@ -284,11 +286,27 @@ impl App {
             return;
         }
 
-        // Login in progress
+        // Login in progress — accept token paste as fallback
         if self.login_state.is_some() {
-            if key == KeyCode::Esc {
-                self.login_state = None;
-                self.status_msg = "Login cancelled".into();
+            match key {
+                KeyCode::Char(c) => { self.login_token_buf.push(c); }
+                KeyCode::Backspace => { self.login_token_buf.pop(); }
+                KeyCode::Enter if !self.login_token_buf.is_empty() => {
+                    let token_val = self.login_token_buf.clone();
+                    self.login_token_buf.clear();
+                    self.login_state = None;
+                    if !token_val.starts_with("clk_") {
+                        self.status_msg = "Invalid key (must start with clk_)".into();
+                    } else {
+                        self.finish_token_login(&token_val);
+                    }
+                }
+                KeyCode::Esc => {
+                    self.login_state = None;
+                    self.login_token_buf.clear();
+                    self.status_msg = "Login cancelled".into();
+                }
+                _ => {}
             }
             return;
         }
@@ -375,6 +393,30 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn finish_token_login(&mut self, token: &str) {
+        match crate::auth::save_login(&self.dir, token, "user") {
+            Ok(()) => {
+                self.status_msg = "Logged in via API key".into();
+                self.reload();
+                let rx = dashboard::start_loading(token);
+                self.dashboard_state.load_state = dashboard::LoadState::Loading { rx };
+                let registry = crate::projects::read_projects(&self.dir);
+                if !registry.onboarding_completed {
+                    if let Some(ob) = onboarding::OnboardingState::new() {
+                        self.onboarding = Some(ob);
+                    } else {
+                        let mut reg = registry;
+                        reg.onboarding_completed = true;
+                        let _ = crate::projects::write_projects(&self.dir, &reg);
+                    }
+                }
+            }
+            Err(e) => {
+                self.status_msg = format!("Failed to save key: {e}");
+            }
         }
     }
 
@@ -632,8 +674,8 @@ pub fn run(dir: &Path) -> i32 {
                 return;
             }
 
-            // Not logged in — show login screen
-            if !app.connected {
+            // Not logged in — show login screen (or login-in-progress with token input)
+            if !app.connected || app.login_state.is_some() {
                 let layout = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([
@@ -646,31 +688,64 @@ pub fn run(dir: &Path) -> i32 {
 
                 header::render_header(frame, layout[0], &app.user_name, app.connected);
 
-                let options = ["Login", "Create account"];
-                let mut lines = vec![
-                    Line::from(""),
-                    Line::from(""),
-                    Line::from(Span::styled("  Welcome to Vibenalytics", theme::text())),
-                    Line::from(""),
-                    Line::from(Span::styled("  Log in to start tracking your Claude Code usage.", theme::dim())),
-                    Line::from(""),
-                    Line::from(""),
-                ];
-                for (i, label) in options.iter().enumerate() {
-                    let is_active = i == app.login_cursor;
-                    let (marker, style) = if is_active {
-                        ("> ", theme::accent_bold())
+                if app.login_state.is_some() {
+                    // Login in progress — show spinner + paste fallback
+                    let spinner = theme::spinner_char();
+                    let mut lines = vec![
+                        Line::from(""),
+                        Line::from(""),
+                        Line::from(vec![
+                            Span::styled(format!("  {spinner} "), theme::accent()),
+                            Span::styled("Waiting for browser login...", theme::text()),
+                        ]),
+                        Line::from(""),
+                    ];
+                    if !app.status_msg.is_empty() {
+                        lines.push(Line::from(Span::styled(format!("  {}", &app.status_msg), theme::dim())));
+                        lines.push(Line::from(""));
+                    }
+                    lines.push(Line::from(Span::styled("  Paste API key if not working:", theme::dim())));
+                    lines.push(Line::from(""));
+                    let display = if app.login_token_buf.is_empty() {
+                        "clk_...".to_string()
                     } else {
-                        ("  ", theme::dim())
+                        app.login_token_buf.clone()
                     };
+                    let input_style = if app.login_token_buf.is_empty() { theme::dim() } else { theme::text() };
                     lines.push(Line::from(vec![
-                        Span::styled(format!("  {marker}"), style),
-                        Span::styled(*label, style),
+                        Span::styled("  > ", theme::accent()),
+                        Span::styled(display, input_style),
+                        Span::styled("_", theme::accent()),
                     ]));
+                    frame.render_widget(ratatui::widgets::Paragraph::new(lines), layout[1]);
+                } else {
+                    // Normal login menu
+                    let options = ["Login", "Create account"];
+                    let mut lines = vec![
+                        Line::from(""),
+                        Line::from(""),
+                        Line::from(Span::styled("  Welcome to Vibenalytics", theme::text())),
+                        Line::from(""),
+                        Line::from(Span::styled("  Log in to start tracking your Claude Code usage.", theme::dim())),
+                        Line::from(""),
+                        Line::from(""),
+                    ];
+                    for (i, label) in options.iter().enumerate() {
+                        let is_active = i == app.login_cursor;
+                        let (marker, style) = if is_active {
+                            ("> ", theme::accent_bold())
+                        } else {
+                            ("  ", theme::dim())
+                        };
+                        lines.push(Line::from(vec![
+                            Span::styled(format!("  {marker}"), style),
+                            Span::styled(*label, style),
+                        ]));
+                    }
+                    frame.render_widget(ratatui::widgets::Paragraph::new(lines), layout[1]);
                 }
-                frame.render_widget(ratatui::widgets::Paragraph::new(lines), layout[1]);
 
-                if !app.status_msg.is_empty() {
+                if app.login_state.is_none() && !app.status_msg.is_empty() {
                     let status_line = ratatui::widgets::Paragraph::new(
                         Line::from(Span::styled(format!("  {}", &app.status_msg), theme::accent_bold()))
                     );
@@ -678,7 +753,7 @@ pub fn run(dir: &Path) -> i32 {
                 }
 
                 let hints = if app.login_state.is_some() {
-                    "esc cancel login"
+                    "enter submit key  esc cancel"
                 } else {
                     "↑/↓ select  enter confirm  esc quit"
                 };
