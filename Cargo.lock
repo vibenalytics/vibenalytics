@@ -1111,6 +1111,7 @@ dependencies = [
  "chrono",
  "clap",
  "crossterm",
+ "iana-time-zone",
  "open",
  "ratatui",
  "serde",

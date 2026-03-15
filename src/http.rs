@@ -1,11 +1,17 @@
 use std::time::Duration;
 
+fn system_timezone() -> String {
+    iana_time_zone::get_timezone().unwrap_or_else(|_| "UTC".to_string())
+}
+
 pub fn http_post(url: &str, body: &str, api_key: Option<&str>) -> Result<(u16, String), String> {
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(10))
         .timeout_read(Duration::from_secs(30))
         .build();
-    let mut req = agent.post(url).set("Content-Type", "application/json");
+    let mut req = agent.post(url)
+        .set("Content-Type", "application/json")
+        .set("X-Timezone", &system_timezone());
     if let Some(key) = api_key {
         req = req.set("X-API-Key", key);
     }
@@ -28,7 +34,8 @@ pub fn http_get(url: &str, api_key: Option<&str>) -> Result<(u16, String), Strin
         .timeout_connect(Duration::from_secs(10))
         .timeout_read(Duration::from_secs(30))
         .build();
-    let mut req = agent.get(url);
+    let mut req = agent.get(url)
+        .set("X-Timezone", &system_timezone());
     if let Some(key) = api_key {
         req = req.set("X-API-Key", key);
     }

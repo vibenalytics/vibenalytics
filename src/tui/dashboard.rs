@@ -1,5 +1,5 @@
 use std::sync::mpsc;
-use chrono::Utc;
+use chrono::Local;
 use ratatui::prelude::*;
 use ratatui::widgets::Paragraph;
 use super::theme;
@@ -66,7 +66,7 @@ pub fn start_loading(api_key: &str) -> mpsc::Receiver<Result<OverviewStats, Stri
     let key = api_key.to_string();
 
     std::thread::spawn(move || {
-        let today = Utc::now().format("%Y-%m-%d").to_string();
+        let today = Local::now().format("%Y-%m-%d").to_string();
         let url = format!("{api_base}/stats/overview?from={today}&to={today}");
         let result = fetch_stats(&url, &key);
         let _ = tx.send(result);
