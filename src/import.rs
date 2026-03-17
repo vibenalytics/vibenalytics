@@ -8,7 +8,7 @@ use crate::config::{config_get, DEFAULT_API_BASE};
 use crate::paths::claude_dir;
 use crate::http::http_post;
 use crate::aggregation::{build_payload, Session};
-use crate::transcripts::{discover_sessions, parse_transcript_from_offset, find_subagent_files, merge_subagent_sessions, read_cursors, write_cursors};
+use crate::transcripts::{discover_sessions, parse_transcript_from_offset, find_subagent_files, merge_subagent_sessions, is_aside_subagent, read_cursors, write_cursors};
 
 pub enum ImportProgress {
     Parsing { total_files: usize },
@@ -75,7 +75,7 @@ fn do_import_bg(
             if let Some((sub_session, sub_offset, sub_rid, sub_mid, sub_out)) =
                 parse_transcript_from_offset(sub_path, 0, "", "", 0, project_name, ph, 0)
             {
-                merge_subagent_sessions(&mut session, sub_session);
+                merge_subagent_sessions(&mut session, sub_session, is_aside_subagent(sub_path));
                 let sub_key = sub_path.to_string_lossy().to_string();
                 if !cursors.contains_key(&sub_key) {
                     cursors.insert(sub_key, json!({
@@ -235,7 +235,7 @@ pub fn cmd_import(dir: &Path, project_filter: Option<&str>, do_sync: bool) -> i3
             if let Some((sub_session, sub_offset, sub_rid, sub_mid, sub_out)) =
                 parse_transcript_from_offset(sub_path, 0, "", "", 0, project_name, ph, 0)
             {
-                merge_subagent_sessions(&mut session, sub_session);
+                merge_subagent_sessions(&mut session, sub_session, is_aside_subagent(sub_path));
                 let sub_key = sub_path.to_string_lossy().to_string();
                 if !cursors.contains_key(&sub_key) {
                     cursors.insert(sub_key, json!({

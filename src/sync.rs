@@ -8,7 +8,7 @@ use crate::config::{config_get, config_get_bool, DEFAULT_API_BASE};
 use crate::paths::{cursors_path, sync_log};
 use crate::http::http_post;
 use crate::aggregation::{build_payload, Session};
-use crate::transcripts::{read_cursors, write_cursors, parse_transcript_from_offset, find_subagent_files, merge_subagent_sessions};
+use crate::transcripts::{read_cursors, write_cursors, parse_transcript_from_offset, find_subagent_files, merge_subagent_sessions, is_aside_subagent};
 
 /// If debugMode is enabled, write the raw sync payload to `sync-debug/` as a timestamped JSON file.
 fn dump_sync_payload(dir: &Path, label: &str, payload: &serde_json::Value) {
@@ -140,7 +140,7 @@ pub fn cmd_sync_transcripts(dir: &Path) -> i32 {
                         0,
                     )
                 {
-                    merge_subagent_sessions(&mut session, sub_session);
+                    merge_subagent_sessions(&mut session, sub_session, is_aside_subagent(sub_path));
                     updated_cursors.push((
                         sub_key,
                         json!({
@@ -350,7 +350,7 @@ pub fn cmd_sync_single_transcript(dir: &Path, transcript_path_str: &str, event_n
                 0,
             )
         {
-            merge_subagent_sessions(&mut session, sub_session);
+            merge_subagent_sessions(&mut session, sub_session, is_aside_subagent(sub_path));
             sub_updated.push((
                 sub_key,
                 json!({
@@ -567,7 +567,7 @@ pub fn dump_transcript_debug(dir: &Path) {
                 if let Some((sub_session, _, _, _, _)) = parse_transcript_from_offset(
                     sub_path, 0, "", "", 0, fallback_project, fallback_path_hash, 0,
                 ) {
-                    merge_subagent_sessions(&mut session, sub_session);
+                    merge_subagent_sessions(&mut session, sub_session, is_aside_subagent(sub_path));
                 }
             }
 
@@ -697,7 +697,7 @@ pub fn cmd_sync_dry(dir: &Path, project_filter: Option<&str>) -> i32 {
                     sub_path, sub_offset, &sub_prev_rid, &sub_prev_mid, sub_prev_out,
                     fallback_project, fallback_path_hash, 0,
                 ) {
-                    merge_subagent_sessions(&mut session, sub_session);
+                    merge_subagent_sessions(&mut session, sub_session, is_aside_subagent(sub_path));
                 }
             }
 

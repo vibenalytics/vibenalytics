@@ -233,6 +233,7 @@ fn is_real_user_prompt(content: &str) -> bool {
         && !content.starts_with("<local-command")
         && !content.starts_with("<bash-")
         && !content.starts_with("/plugin")
+        && !content.starts_with("<task-notification")
 }
 
 /// Extract file extension from a path (e.g. "/foo/bar.rs" -> "rs", "Makefile" -> "").
@@ -300,6 +301,7 @@ pub fn parse_session_transcript(filepath: &Path, fallback_project: &str, fallbac
     let mut seen_user_messages: HashSet<String> = HashSet::new();
     let mut current_prompt_index: i32 = -1;
     let mut current_prompt_tools: HashMap<String, u32> = HashMap::new();
+    let mut current_prompt_subagents: HashMap<String, u32> = HashMap::new();
     let mut current_prompt_ts = String::new();
     let mut current_prompt_length: usize = 0;
     let mut current_prompt_type = String::new();
@@ -463,6 +465,14 @@ pub fn parse_session_transcript(filepath: &Path, fallback_project: &str, fallbac
                                         }
                                     }
                                 }
+                                // Extract subagent type from Agent/Task tool invocations
+                                if tool == "Agent" || tool == "Task" {
+                                    let agent_type = block.pointer("/input/subagent_type")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("general-purpose");
+                                    *session.subagents.entry(agent_type.to_string()).or_insert(0) += 1;
+                                    *current_prompt_subagents.entry(agent_type.to_string()).or_insert(0) += 1;
+                                }
                             } else if tool_id.is_empty() {
                                 let tool = block.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
                                 *session.tools.entry(tool.to_string()).or_insert(0) += 1;
@@ -494,12 +504,14 @@ pub fn parse_session_transcript(filepath: &Path, fallback_project: &str, fallbac
                             cache_creation_tokens: 0,
                             request_count: 0,
                             tools: std::mem::take(&mut current_prompt_tools),
+                            subagents: std::mem::take(&mut current_prompt_subagents),
                             model: String::new(),
                             prompt_length: std::mem::replace(&mut current_prompt_length, 0),
                             msg_type: std::mem::take(&mut current_prompt_type),
                             command: std::mem::take(&mut current_prompt_command),
                             skills: std::mem::take(&mut current_prompt_skills),
                             subagent_count: 0,
+                            aside_count: 0,
                             compaction_trigger: String::new(),
                             compaction_pre_tokens: 0,
                             context_tokens: 0,
@@ -524,12 +536,14 @@ pub fn parse_session_transcript(filepath: &Path, fallback_project: &str, fallbac
                             cache_creation_tokens: 0,
                             request_count: 0,
                             tools: HashMap::new(),
+                            subagents: HashMap::new(),
                             model: String::new(),
                             prompt_length: 0,
                             msg_type: "compaction".to_string(),
                             command: String::new(),
                             skills: Vec::new(),
                             subagent_count: 0,
+                            aside_count: 0,
                             compaction_trigger: trigger,
                             compaction_pre_tokens: pre_tokens,
                             context_tokens: 0,
@@ -553,12 +567,14 @@ pub fn parse_session_transcript(filepath: &Path, fallback_project: &str, fallbac
                                 cache_creation_tokens: 0,
                                 request_count: 0,
                                 tools: std::mem::take(&mut current_prompt_tools),
+                                subagents: std::mem::take(&mut current_prompt_subagents),
                                 model: String::new(),
                                 prompt_length: std::mem::replace(&mut current_prompt_length, 0),
                                 msg_type: std::mem::take(&mut current_prompt_type),
                                 command: std::mem::take(&mut current_prompt_command),
                                 skills: std::mem::take(&mut current_prompt_skills),
                                 subagent_count: 0,
+                                aside_count: 0,
                                 compaction_trigger: String::new(),
                                 compaction_pre_tokens: 0,
                                 context_tokens: 0,
@@ -680,12 +696,14 @@ pub fn parse_session_transcript(filepath: &Path, fallback_project: &str, fallbac
             cache_creation_tokens: 0,
             request_count: 0,
             tools: current_prompt_tools,
+            subagents: current_prompt_subagents,
             model: String::new(),
             prompt_length: current_prompt_length,
             msg_type: current_prompt_type,
             command: current_prompt_command,
             skills: current_prompt_skills,
             subagent_count: 0,
+            aside_count: 0,
             compaction_trigger: String::new(),
             compaction_pre_tokens: 0,
             context_tokens: 0,
@@ -719,6 +737,7 @@ pub fn parse_session_transcript(filepath: &Path, fallback_project: &str, fallbac
             cache_read_tokens: accum.cache_read_tokens,
             cache_creation_tokens: accum.cache_creation_tokens,
             is_subagent: false,
+            is_aside: false,
             prompt_index: accum.prompt_index,
             tools: accum.tools,
             lines_added: accum.lines_added,
@@ -782,6 +801,7 @@ pub fn parse_transcript_from_offset(
     let mut seen_user_messages: HashSet<String> = HashSet::new();
     let mut current_prompt_index: i32 = prompt_index_offset - 1;
     let mut current_prompt_tools: HashMap<String, u32> = HashMap::new();
+    let mut current_prompt_subagents: HashMap<String, u32> = HashMap::new();
     let mut current_prompt_ts = String::new();
     let mut current_prompt_length: usize = 0;
     let mut current_prompt_type = String::new();
@@ -959,6 +979,14 @@ pub fn parse_transcript_from_offset(
                                         }
                                     }
                                 }
+                                // Extract subagent type from Agent/Task tool invocations
+                                if tool == "Agent" || tool == "Task" {
+                                    let agent_type = block.pointer("/input/subagent_type")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("general-purpose");
+                                    *session.subagents.entry(agent_type.to_string()).or_insert(0) += 1;
+                                    *current_prompt_subagents.entry(agent_type.to_string()).or_insert(0) += 1;
+                                }
                             } else if tool_id.is_empty() {
                                 let tool = block.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
                                 *session.tools.entry(tool.to_string()).or_insert(0) += 1;
@@ -989,12 +1017,14 @@ pub fn parse_transcript_from_offset(
                             cache_creation_tokens: 0,
                             request_count: 0,
                             tools: std::mem::take(&mut current_prompt_tools),
+                            subagents: std::mem::take(&mut current_prompt_subagents),
                             model: String::new(),
                             prompt_length: std::mem::replace(&mut current_prompt_length, 0),
                             msg_type: std::mem::take(&mut current_prompt_type),
                             command: std::mem::take(&mut current_prompt_command),
                             skills: std::mem::take(&mut current_prompt_skills),
                             subagent_count: 0,
+                            aside_count: 0,
                             compaction_trigger: String::new(),
                             compaction_pre_tokens: 0,
                             context_tokens: 0,
@@ -1019,12 +1049,14 @@ pub fn parse_transcript_from_offset(
                             cache_creation_tokens: 0,
                             request_count: 0,
                             tools: HashMap::new(),
+                            subagents: HashMap::new(),
                             model: String::new(),
                             prompt_length: 0,
                             msg_type: "compaction".to_string(),
                             command: String::new(),
                             skills: Vec::new(),
                             subagent_count: 0,
+                            aside_count: 0,
                             compaction_trigger: trigger,
                             compaction_pre_tokens: pre_tokens,
                             context_tokens: 0,
@@ -1047,12 +1079,14 @@ pub fn parse_transcript_from_offset(
                                 cache_creation_tokens: 0,
                                 request_count: 0,
                                 tools: std::mem::take(&mut current_prompt_tools),
+                                subagents: std::mem::take(&mut current_prompt_subagents),
                                 model: String::new(),
                                 prompt_length: std::mem::replace(&mut current_prompt_length, 0),
                                 msg_type: std::mem::take(&mut current_prompt_type),
                                 command: std::mem::take(&mut current_prompt_command),
                                 skills: std::mem::take(&mut current_prompt_skills),
                                 subagent_count: 0,
+                                aside_count: 0,
                                 compaction_trigger: String::new(),
                                 compaction_pre_tokens: 0,
                                 context_tokens: 0,
@@ -1180,12 +1214,14 @@ pub fn parse_transcript_from_offset(
             cache_creation_tokens: 0,
             request_count: 0,
             tools: current_prompt_tools,
+            subagents: current_prompt_subagents,
             model: String::new(),
             prompt_length: current_prompt_length,
             msg_type: current_prompt_type,
             command: current_prompt_command,
             skills: current_prompt_skills,
             subagent_count: 0,
+            aside_count: 0,
             compaction_trigger: String::new(),
             compaction_pre_tokens: 0,
             context_tokens: 0,
@@ -1243,6 +1279,7 @@ pub fn parse_transcript_from_offset(
             cache_read_tokens: if is_boundary { 0 } else { accum.cache_read_tokens },
             cache_creation_tokens: if is_boundary { 0 } else { accum.cache_creation_tokens },
             is_subagent: false,
+            is_aside: false,
             prompt_index: accum.prompt_index,
             tools: accum.tools.clone(),
             lines_added: accum.lines_added,
@@ -1262,7 +1299,12 @@ pub fn parse_transcript_from_offset(
 
 // ---- Subagent merging ----
 
-pub fn merge_subagent_sessions(parent: &mut Session, subagent: Session) {
+/// Returns true if a subagent file path is an aside_question (/btw) conversation.
+pub fn is_aside_subagent(path: &Path) -> bool {
+    path.to_string_lossy().contains("agent-aside_question-")
+}
+
+pub fn merge_subagent_sessions(parent: &mut Session, subagent: Session, is_aside: bool) {
     // Build prompt timestamp ranges for attribution
     let mut prompt_ranges: Vec<(i32, String, String)> = Vec::new();
     {
@@ -1291,6 +1333,7 @@ pub fn merge_subagent_sessions(parent: &mut Session, subagent: Session) {
 
     for mut req in subagent.requests {
         req.is_subagent = true;
+        req.is_aside = is_aside;
         // Assign prompt_index based on timestamp range
         if !prompt_ranges.is_empty() {
             for (idx, start, end) in &prompt_ranges {
@@ -1319,10 +1362,13 @@ pub fn merge_subagent_sessions(parent: &mut Session, subagent: Session) {
         parent.requests.push(req);
     }
 
-    // Increment subagent_count for each prompt that received requests from this subagent
+    // Increment subagent_count (and aside_count if applicable) for each prompt that received requests
     for prompt in &mut parent.prompts {
         if prompts_with_subagent.contains(&prompt.prompt_index) {
             prompt.subagent_count += 1;
+            if is_aside {
+                prompt.aside_count += 1;
+            }
         }
     }
 }

@@ -415,7 +415,7 @@ fn main() {
                 Some(mut session) => {
                     for sub_path in transcripts::find_subagent_files(&path) {
                         if let Some(sub) = transcripts::parse_session_transcript(&sub_path, "test", "") {
-                            transcripts::merge_subagent_sessions(&mut session, sub);
+                            transcripts::merge_subagent_sessions(&mut session, sub, transcripts::is_aside_subagent(&sub_path));
                         }
                     }
                     let payload = aggregation::build_payload(&[session]);

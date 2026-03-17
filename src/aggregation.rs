@@ -20,6 +20,7 @@ pub struct RequestUsage {
     pub cache_read_tokens: u64,
     pub cache_creation_tokens: u64,
     pub is_subagent: bool,
+    pub is_aside: bool,
     pub prompt_index: i32,
     pub tools: HashMap<String, u32>,
     pub lines_added: u64,
@@ -41,7 +42,9 @@ pub struct PromptUsage {
     pub msg_type: String,
     pub command: String,
     pub skills: Vec<String>,
+    pub subagents: HashMap<String, u32>,
     pub subagent_count: u32,
+    pub aside_count: u32,
     pub compaction_trigger: String,
     pub compaction_pre_tokens: u64,
     pub context_tokens: u64,
@@ -99,6 +102,7 @@ pub struct Session {
     pub permission_mode: String,
     pub events: HashMap<String, u32>,
     pub tools: HashMap<String, u32>,
+    pub subagents: HashMap<String, u32>,
     pub prompt_count: u32,
     pub message_count: u32,
     pub total_input_tokens: u64,
@@ -134,6 +138,7 @@ impl Session {
             permission_mode: String::new(),
             events: HashMap::new(),
             tools: HashMap::new(),
+            subagents: HashMap::new(),
             prompt_count: 0,
             message_count: 0,
             total_input_tokens: 0,
@@ -179,7 +184,9 @@ pub fn build_prompts(session: &Session) -> Vec<PromptUsage> {
             msg_type: String::new(),
             command: String::new(),
             skills: Vec::new(),
+            subagents: HashMap::new(),
             subagent_count: 0,
+            aside_count: 0,
             compaction_trigger: String::new(),
             compaction_pre_tokens: 0,
             context_tokens: 0,
@@ -217,13 +224,18 @@ pub fn build_prompts(session: &Session) -> Vec<PromptUsage> {
             msg_type: String::new(),
             command: String::new(),
             skills: Vec::new(),
+            subagents: HashMap::new(),
             subagent_count: 0,
+            aside_count: 0,
             compaction_trigger: String::new(),
             compaction_pre_tokens: 0,
             context_tokens: 0,
         });
         for (tool, count) in &prompt.tools {
             *p.tools.entry(tool.clone()).or_insert(0) += count;
+        }
+        for (agent_type, count) in &prompt.subagents {
+            *p.subagents.entry(agent_type.clone()).or_insert(0) += count;
         }
         if prompt.prompt_length > 0 {
             p.prompt_length = prompt.prompt_length;
@@ -241,6 +253,9 @@ pub fn build_prompts(session: &Session) -> Vec<PromptUsage> {
         }
         if prompt.subagent_count > 0 {
             p.subagent_count += prompt.subagent_count;
+        }
+        if prompt.aside_count > 0 {
+            p.aside_count += prompt.aside_count;
         }
         if !prompt.compaction_trigger.is_empty() {
             p.compaction_trigger = prompt.compaction_trigger.clone();
@@ -346,6 +361,12 @@ pub fn build_payload(sessions: &[Session]) -> Value {
                         if p.subagent_count > 0 {
                             pobj["subagent_count"] = json!(p.subagent_count);
                         }
+                        if p.aside_count > 0 {
+                            pobj["aside_count"] = json!(p.aside_count);
+                        }
+                        if !p.subagents.is_empty() {
+                            pobj["subagents"] = json!(p.subagents);
+                        }
                         if let Some(reqs) = requests_by_prompt.get(&p.prompt_index) {
                             pobj["requests"] = json!(reqs.iter().map(|r| {
                                 let mut robj = json!({
@@ -358,6 +379,7 @@ pub fn build_payload(sessions: &[Session]) -> Value {
                                     "cache_read_tokens": r.cache_read_tokens,
                                     "cache_creation_tokens": r.cache_creation_tokens,
                                     "is_subagent": r.is_subagent,
+                                    "is_aside": r.is_aside,
                                     "tools": r.tools,
                                 });
                                 robj["lines_added"] = json!(r.lines_added);
