@@ -173,7 +173,14 @@ pub fn cmd_sync_transcripts(dir: &Path) -> i32 {
     }
 
     let pre_filter = sessions.len();
-    let sessions = crate::projects::filter_sessions_by_enabled(dir, sessions);
+    let mut sessions = crate::projects::filter_sessions_by_enabled(dir, sessions);
+
+    // Attach group_id from project registry for team auto-linking
+    for s in &mut sessions {
+        if !s.path_hash.is_empty() && s.group_id.is_none() {
+            s.group_id = crate::projects::get_group_id(dir, &s.path_hash);
+        }
+    }
 
     if sessions.is_empty() {
         if pre_filter > 0 {
@@ -371,6 +378,10 @@ pub fn cmd_sync_single_transcript(dir: &Path, transcript_path_str: &str, event_n
         if crate::projects::is_project_enabled(dir, &session.path_hash) == Some(false) {
             let _ = fs::remove_file(&lock);
             return 0;
+        }
+        // Attach group_id from project registry for team auto-linking
+        if session.group_id.is_none() {
+            session.group_id = crate::projects::get_group_id(dir, &session.path_hash);
         }
     }
 

@@ -5,6 +5,7 @@
 mod aggregation;
 mod auth;
 mod config;
+mod group;
 mod hash;
 mod http;
 mod import;
@@ -51,6 +52,18 @@ enum Commands {
     Project {
         #[command(subcommand)]
         action: ProjectAction,
+    },
+
+    /// Manage project groups (connect projects to teams)
+    Group {
+        #[command(subcommand)]
+        action: GroupAction,
+    },
+
+    /// Manage team memberships
+    Team {
+        #[command(subcommand)]
+        action: TeamAction,
     },
 
     /// Manually trigger a sync
@@ -125,6 +138,36 @@ enum ProjectAction {
     Disable {
         /// Project name (or omit to use current directory)
         name: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum GroupAction {
+    /// Connect current project to a group
+    Connect {
+        /// Group identifier (slug from web dashboard)
+        identifier: String,
+    },
+
+    /// Disconnect current project from its group
+    Disconnect,
+
+    /// Show current project's group connection
+    Status,
+
+    /// List all accessible groups (personal + team)
+    List,
+}
+
+#[derive(Subcommand)]
+enum TeamAction {
+    /// List your teams
+    List,
+
+    /// Join a team via invite token
+    Join {
+        /// Invite token from team admin
+        token: String,
     },
 }
 
@@ -386,6 +429,18 @@ fn main() {
                     }
                 }
             }
+        },
+
+        Some(Commands::Group { action }) => match action {
+            GroupAction::Connect { identifier } => group::cmd_connect(&dir, &identifier),
+            GroupAction::Disconnect => group::cmd_disconnect(&dir),
+            GroupAction::Status => group::cmd_group_status(&dir),
+            GroupAction::List => group::cmd_group_list(&dir, cli.json),
+        },
+
+        Some(Commands::Team { action }) => match action {
+            TeamAction::List => group::cmd_team_list(&dir, cli.json),
+            TeamAction::Join { token } => group::cmd_team_join(&dir, &token),
         },
 
         Some(Commands::Settings { action }) => cmd_settings(&dir, action),

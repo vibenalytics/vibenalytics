@@ -13,6 +13,10 @@ pub struct ProjectEntry {
     pub path_hash: String,
     pub enabled: bool,
     pub added_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +62,25 @@ pub fn is_project_enabled(dir: &Path, ph: &str) -> Option<bool> {
         .map(|p| p.enabled)
 }
 
+/// Look up group_id for a project by path_hash.
+pub fn get_group_id(dir: &Path, ph: &str) -> Option<String> {
+    let registry = read_projects(dir);
+    registry.projects.iter()
+        .find(|p| p.path_hash == ph)
+        .and_then(|p| p.group_id.clone())
+}
+
+/// Set or clear group_id for a project by path_hash.
+pub fn set_group_id(dir: &Path, ph: &str, group_id: Option<&str>, group_name: Option<&str>) -> Result<(), String> {
+    let mut registry = read_projects(dir);
+    let project = registry.projects.iter_mut()
+        .find(|p| p.path_hash == ph)
+        .ok_or_else(|| "Project not found in registry".to_string())?;
+    project.group_id = group_id.map(|s| s.to_string());
+    project.group_name = group_name.map(|s| s.to_string());
+    write_projects(dir, &registry).map_err(|e| format!("Failed to write projects.json: {e}"))
+}
+
 /// Find a project by name or by path_hash derived from cwd.
 pub fn find_project<'a>(registry: &'a ProjectRegistry, name_or_cwd: &str) -> Option<usize> {
     // Try by name first
@@ -99,6 +122,8 @@ pub fn add_project(dir: &Path, project_path: &str) -> Result<String, String> {
         path_hash: ph,
         enabled: true, // explicit add = always enabled
         added_at: Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+        group_id: None,
+        group_name: None,
     });
 
     write_projects(dir, &registry).map_err(|e| format!("Failed to write projects.json: {e}"))?;
@@ -182,6 +207,8 @@ pub fn filter_sessions_by_enabled<S: HasProjectHash>(dir: &Path, mut sessions: V
                     path_hash: ph.clone(),
                     enabled: *enabled,
                     added_at: now.clone(),
+                    group_id: None,
+                    group_name: None,
                 });
             }
         }
@@ -218,6 +245,8 @@ pub fn register_projects_bulk(
             path_hash: path_hash.clone(),
             enabled: *enabled,
             added_at: now.clone(),
+            group_id: None,
+            group_name: None,
         });
     }
 

@@ -118,6 +118,8 @@ pub struct Session {
     pub total_lines_added: u64,
     pub total_lines_removed: u64,
     pub total_lines_by_extension: HashMap<String, (u64, u64)>,
+    /// Group ID for team auto-linking during sync
+    pub group_id: Option<String>,
 }
 
 impl crate::projects::HasProjectHash for Session {
@@ -154,6 +156,7 @@ impl Session {
             total_lines_added: 0,
             total_lines_removed: 0,
             total_lines_by_extension: HashMap::new(),
+            group_id: None,
         }
     }
 }
@@ -320,6 +323,9 @@ pub fn build_payload(sessions: &[Session]) -> Value {
                 obj["lines_by_extension"] = Value::Object(ext_map);
             }
             obj["cli_version"] = json!(env!("CARGO_PKG_VERSION"));
+            if let Some(ref gid) = s.group_id {
+                obj["group_id"] = json!(gid);
+            }
             if !s.requests.is_empty() {
                 // Group requests by prompt_index for nesting inside prompts
                 let mut requests_by_prompt: HashMap<i32, Vec<&RequestUsage>> = HashMap::new();
