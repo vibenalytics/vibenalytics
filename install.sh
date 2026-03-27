@@ -104,17 +104,59 @@ if [ -f "$TMPDIR/checksums.json" ]; then
   fi
 fi
 
-# Extract and install
+# Extract binary
 tar xzf "$TMPDIR/${PLATFORM}.tar.gz" -C "$TMPDIR"
-mkdir -p "$INSTALL_DIR"
-mv "$TMPDIR/${PLATFORM}" "$INSTALL_DIR/vibenalytics"
-chmod +x "$INSTALL_DIR/vibenalytics"
 
-# Verify installation
-if "$INSTALL_DIR/vibenalytics" status >/dev/null 2>&1 || true; then
-  echo ""
-  echo "Installed vibenalytics ${VERSION} to ${INSTALL_DIR}/vibenalytics"
+# Versioned install layout:
+#   ~/.local/share/vibenalytics/versions/{version}  (binary)
+#   ~/.local/bin/vibenalytics -> versions/{version}  (symlink)
+VERSIONS_DIR="$HOME/.local/share/vibenalytics/versions"
+VERSION_NUM="${VERSION#v}"
+VERSION_BIN="$VERSIONS_DIR/$VERSION_NUM"
+LINK_PATH="$INSTALL_DIR/vibenalytics"
+
+mkdir -p "$VERSIONS_DIR"
+mkdir -p "$INSTALL_DIR"
+
+# Install binary to versions directory
+mv "$TMPDIR/${PLATFORM}" "$VERSION_BIN"
+chmod +x "$VERSION_BIN"
+
+# Migrate: if existing install is a regular file (not symlink), preserve it
+if [ -f "$LINK_PATH" ] && [ ! -L "$LINK_PATH" ]; then
+  OLD_VERSION=$("$LINK_PATH" -V 2>/dev/null | awk '{print $NF}' || echo "")
+  if [ -n "$OLD_VERSION" ] && [ "$OLD_VERSION" != "$VERSION_NUM" ]; then
+    OLD_BIN="$VERSIONS_DIR/$OLD_VERSION"
+    if [ ! -f "$OLD_BIN" ]; then
+      mv "$LINK_PATH" "$OLD_BIN"
+      echo "Migrated existing v${OLD_VERSION} to versions directory"
+    else
+      rm -f "$LINK_PATH"
+    fi
+  else
+    rm -f "$LINK_PATH"
+  fi
 fi
+
+# Atomic symlink swap: temp symlink + rename (no gap where binary is missing)
+TEMP_LINK="$INSTALL_DIR/.vibenalytics.tmp.$$"
+rm -f "$TEMP_LINK"
+ln -s "$VERSION_BIN" "$TEMP_LINK"
+mv "$TEMP_LINK" "$LINK_PATH"
+
+# Clean up old versions (keep 2 most recent)
+cd "$VERSIONS_DIR"
+# shellcheck disable=SC2012
+ls -t | tail -n +3 | while read -r old; do
+  [ "$old" = "$VERSION_NUM" ] && continue
+  rm -f "$VERSIONS_DIR/$old"
+done
+cd - >/dev/null
+
+echo ""
+echo "Installed vibenalytics ${VERSION} to ${LINK_PATH}"
+echo "  Binary:  ${VERSION_BIN}"
+echo "  Symlink: ${LINK_PATH} -> ${VERSION_BIN}"
 
 # Check PATH
 if ! echo "$PATH" | tr ':' '\n' | grep -q "^${INSTALL_DIR}$"; then

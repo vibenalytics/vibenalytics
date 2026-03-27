@@ -59,6 +59,11 @@ pub fn cmd_log(dir: &Path) -> i32 {
         }
     }
 
+    // Auto-update on SessionStart
+    if event_name == "SessionStart" {
+        crate::update::auto_update(dir);
+    }
+
     let is_boundary = SYNC_EVENTS.contains(&event_name);
 
     let tool_name = obj.get("tool_name").and_then(|v| v.as_str()).unwrap_or("-");

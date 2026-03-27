@@ -103,6 +103,10 @@ enum Commands {
     #[command(hide = true)]
     Log,
 
+    /// (internal) Background update check - downloads new version to staging
+    #[command(name = "_update-check", hide = true)]
+    UpdateCheck,
+
     /// (debug) Parse a transcript file and print the payload JSON
     #[command(hide = true)]
     ParseTranscript {
@@ -459,6 +463,8 @@ fn main() {
         }
 
         Some(Commands::Update) => update::cmd_update(),
+
+        Some(Commands::UpdateCheck) => update::cmd_background_update_check(&dir),
 
         Some(Commands::Log) => {
             log_cmd::cmd_log(&dir)
