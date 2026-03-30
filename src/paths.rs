@@ -40,6 +40,10 @@ pub fn projects_path(dir: &Path) -> PathBuf {
     dir.join("projects.json")
 }
 
+pub fn pending_path(dir: &Path) -> PathBuf {
+    dir.join("subagent-pending.json")
+}
+
 pub fn sync_log(dir: &Path, msg: &str) {
     let path = log_path(dir);
     let ts = Utc::now().format("%Y-%m-%dT%H:%M:%SZ");

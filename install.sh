@@ -163,7 +163,12 @@ if ! echo "$PATH" | tr ':' '\n' | grep -q "^${INSTALL_DIR}$"; then
   echo ""
   echo "Warning: ${INSTALL_DIR} is not in your PATH."
   echo "Add it with:"
-  echo "  echo 'export PATH=\"${INSTALL_DIR}:\$PATH\"' >> ~/.zshrc"
+  case "${SHELL:-/bin/bash}" in
+    */zsh)  RC_FILE="~/.zshrc" ;;
+    */bash) RC_FILE="~/.bashrc" ;;
+    *)      RC_FILE="~/.profile" ;;
+  esac
+  echo "  echo 'export PATH=\"${INSTALL_DIR}:\$PATH\"' >> ${RC_FILE} && source ${RC_FILE}"
   echo ""
 fi
 
